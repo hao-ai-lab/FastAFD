@@ -58,8 +58,18 @@ class TensorRTLLMBackend(BaseAttnBackend):
             )
         return self._decode_cu_seqlens_q[:needed]
 
+    def _num_pages(self, num_tokens: int) -> int:
+        """Page-table columns a sequence of ``num_tokens`` tokens occupies.
+
+        Capture and replay must derive this the same way. The captured graph
+        bakes in the width of `capture.page_table`, while replay copies a table
+        built from the batch's own longest sequence; if the two rules disagree
+        the copy fails with an opaque shape error far from the cause.
+        """
+        return (int(num_tokens) + int(self.page_size) - 1) // int(self.page_size)
+
     def _get_page_offsets(self, max_seqlen_k: int) -> torch.Tensor:
-        page_count = (int(max_seqlen_k) + int(self.page_size) - 1) // int(self.page_size)
+        page_count = self._num_pages(max_seqlen_k)
         offsets = self._page_offsets_by_len.get(page_count)
         if offsets is None:
             offsets = (
@@ -177,7 +187,7 @@ class TensorRTLLMBackend(BaseAttnBackend):
         assert self.capture is None, "Capture already initialized."
         max_bs = max(bs_list)
         capture = TRTLLMCaptureData.create(
-            max_bs, max_seq_len // self.page_size, self.kvcache.device
+            max_bs, self._num_pages(max_seq_len), self.kvcache.device
         )
         self.capture = capture
         self.capture_bs = sorted(bs_list)
@@ -201,6 +211,15 @@ class TensorRTLLMBackend(BaseAttnBackend):
         assert self.capture is not None and bs in self.capture_bs
         # cu_seqlens_q is always [0, 1, 2, ..., bs] for decode (i.e. no-op)
         table_len = metadata.page_table.size(1)
+        captured_len = self.capture.page_table.size(1)
+        if table_len > captured_len:
+            # Slicing to [:captured_len] would silently narrow the destination and
+            # surface as a bare shape mismatch, which says nothing about pages.
+            raise ValueError(
+                f"replay needs {table_len} page-table columns but the captured "
+                f"buffer has {captured_len} (page_size={self.page_size}); the "
+                f"capture and replay page-count rules have diverged"
+            )
         self.capture.cu_seqlens_k[: bs + 1].copy_(metadata.cu_seqlens_k)
         self.capture.seq_lens[:bs].copy_(metadata.cache_seqlens)
         self.capture.page_table[:bs, :table_len].copy_(metadata.page_table)

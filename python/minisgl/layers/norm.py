@@ -38,6 +38,34 @@ class RMSNormFused(BaseOP):
         return x, residual
 
 
+class RMSNormOffset(RMSNorm):
+    """Gemma/Qwen3.5 RMSNorm with checkpoint multiplier ``1 + weight``.
+
+    The offset is folded once while loading so existing FlashInfer and fused
+    QK-norm kernels consume the effective multiplier without a per-token add.
+    """
+
+    def load_state_dict(self, state_dict, *, prefix="", _internal=False) -> None:
+        key = f"{prefix}.weight" if prefix else "weight"
+        item = state_dict.pop(key)
+        assert self.weight.shape == item.shape and self.weight.dtype == item.dtype
+        self.weight = item + 1
+        if not _internal and state_dict:
+            raise RuntimeError(f"Unexpected keys in state_dict: {list(state_dict.keys())}")
+
+
+class RMSNormOffsetFused(RMSNormFused):
+    """Residual-fused form of :class:`RMSNormOffset`."""
+
+    def load_state_dict(self, state_dict, *, prefix="", _internal=False) -> None:
+        key = f"{prefix}.weight" if prefix else "weight"
+        item = state_dict.pop(key)
+        assert self.weight.shape == item.shape and self.weight.dtype == item.dtype
+        self.weight = item + 1
+        if not _internal and state_dict:
+            raise RuntimeError(f"Unexpected keys in state_dict: {list(state_dict.keys())}")
+
+
 def _qk_variance(q: torch.Tensor, k: torch.Tensor):
     q = q.float()
     k = k.float()

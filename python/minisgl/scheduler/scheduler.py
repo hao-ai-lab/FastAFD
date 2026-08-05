@@ -140,6 +140,7 @@ def _materialize_batch_metadata(
     batch.positions = positions_device
     batch.positions_host = positions_host
     input_mapping = _make_input_tuple(batch, device)
+    batch.state_indices = input_mapping[0]
     write_mapping = _make_write_tuple(batch, device)
     batch.out_loc = page_table[input_mapping]
     if token_pool is not None:
@@ -151,6 +152,11 @@ class Scheduler(SchedulerIOMixin):
     def __init__(self, config: SchedulerConfig):
         from minisgl.engine import Engine
 
+        if config.model_config.is_hybrid_attention and config.cache_type != "naive":
+            raise RuntimeError(
+                "Hybrid GDN models require cache_type='naive' until GDN prefix "
+                "state snapshots are implemented"
+            )
         self.engine = Engine(config)
 
         # use another stream to overlap metadata processing with computation

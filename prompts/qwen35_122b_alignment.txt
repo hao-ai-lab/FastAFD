@@ -1,0 +1,8 @@
+Explain in one paragraph how recurrent linear attention differs from full attention during autoregressive decoding.
+Write a Python function that returns the first n Fibonacci numbers, then state its time complexity.
+What is 17 multiplied by 23? Show the intermediate arithmetic briefly.
+Summarize why expert parallelism is useful for mixture-of-experts inference.
+Translate "Verification must use measured evidence" into Chinese.
+List three practical checks to perform before launching a distributed GPU job.
+If a cache has 64 free slots and allocates 19, then releases 7, how many free slots remain?
+Describe the purpose of a numerical alignment test in one concise paragraph.

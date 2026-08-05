@@ -131,7 +131,6 @@ def _run_eg_deepep_pipeline_body(
         [None for _ in range(num_mb)] for _ in range(num_layers)
     ]
     retired: list[tuple[torch.cuda.Event, Any, Any]] = []
-    graph_live_objects: list[Any] = []
 
     def retire(force: bool = False) -> None:
         if not retired:
@@ -187,8 +186,11 @@ def _run_eg_deepep_pipeline_body(
             retired.append((done, disp, expert_out))
             if len(retired) >= 4:
                 retire(force=True)
-        elif torch.cuda.is_current_stream_capturing():
-            graph_live_objects.extend((disp, expert_out))
+        # During graph capture, release each layer's Python objects as soon as
+        # combine has been enqueued. Dispatch storage is created and retired on
+        # the lane stream; expert_out.record_stream above covers its
+        # engine-to-lane handoff. Retaining every layer until capture ends
+        # prevents the graph-private allocator from reusing those buffers.
         dispatches[layer][mb] = None
         expert_outputs[layer][mb] = None
 
@@ -383,10 +385,13 @@ class AfdEgDecodeGraphRunner:
             fn=_fn,
         )
         self.graphs[total] = graph
+        allocated_gib = torch.cuda.memory_allocated(self.device) / (1024**3)
+        reserved_gib = torch.cuda.memory_reserved(self.device) / (1024**3)
         log_line(
             self.log_path,
             f"[{self.label}] afd_eg_decode_graph warmup:done total={total} "
-            f"mb_bs={mb_bs} schedule=paper_pipeline lanes={len(lane_streams)}",
+            f"mb_bs={mb_bs} schedule=paper_pipeline lanes={len(lane_streams)} "
+            f"allocated_gib={allocated_gib:.2f} reserved_gib={reserved_gib:.2f}",
             flush=True,
         )
 
@@ -599,15 +604,15 @@ class AfdExpertWorker(BaseAfdWorker):
                 )
 
     def afd_overlap_loop(self) -> None:
-        """Fixed two-step-ahead EG loop.
+        """Finite-window step-ahead EG loop.
 
-        Launch two future commands before retiring the oldest ack handle, matching
-        the AG loop. AfdFlushStepCmd is the explicit pipeline-drain marker.
+        Match the AG worker's configured pending window before retiring the
+        oldest ack handle. AfdFlushStepCmd drains the pipeline.
         """
         pending: deque[_AfdEgInFlight] = deque()
 
         def retire(force: bool = False) -> None:
-            while pending and (force or len(pending) > 2):
+            while pending and (force or len(pending) > self.async_retire_depth):
                 self._process_last_afd_eg(pending.popleft())
 
         while True:

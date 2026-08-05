@@ -356,9 +356,9 @@ def topk_softmax_group_local(
     num_tokens, num_experts = gating_output.shape
     if num_tokens == 0:
         return
-    if (num_experts & (num_experts - 1)) != 0 or num_experts > 256:
+    if (num_experts & (num_experts - 1)) != 0 or num_experts > 512:
         raise RuntimeError(
-            "topk_softmax_group_local supports only power-of-two num_experts <= 256, "
+            "topk_softmax_group_local supports only power-of-two num_experts <= 512, "
             f"got {num_experts}"
         )
 

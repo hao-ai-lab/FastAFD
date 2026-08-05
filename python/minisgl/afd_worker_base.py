@@ -116,6 +116,7 @@ class BaseAfdWorker:
         moe_runner_backend: str = "auto",
         ray_nsys: bool = False,
         disable_overlap: bool = False,
+        async_pending_steps: int = 3,
         afd_num_mb: int = 1,
         rpc_timeout_ms: int = 300_000,
         attn_dp_rank: int = 0,
@@ -204,6 +205,8 @@ class BaseAfdWorker:
         self.mlp_ep_size = int(ep_size)
         self.ep_size = self.mlp_ep_size if role == "mlp" else 1
         self.disable_overlap = bool(disable_overlap)
+        self.async_pending_steps = max(2, int(async_pending_steps))
+        self.async_retire_depth = self.async_pending_steps - 1
         self.afd_num_mb = max(1, int(afd_num_mb))
         self._control_profile_start_step = int(
             os.environ.get("MINISGL_AFD_CONTROL_PROFILE_START_STEP", "0") or 0
@@ -327,6 +330,10 @@ class BaseAfdWorker:
             f"attn_tp_size={self.attn_tp_size} mlp_tp_size={self.mlp_tp_size} "
             f"device_comm_num_sms={self.device_comm_num_sms} "
             f"afd_num_mb={self.afd_num_mb} "
+            f"disable_overlap={self.disable_overlap} "
+            f"async_pending_steps={self.async_pending_steps} "
+            f"async_retire_depth={self.async_retire_depth} "
+            f"cuda_device_max_connections={os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS', '<unset>')} "
             f"dual_stream_microbatch={self._dual_stream_microbatch} "
             f"rpc_timeout_ms={self._recv_timeout_ms} "
             f"decode_graph_bs={list(self.decode_graph_bs)} "
@@ -360,6 +367,49 @@ class BaseAfdWorker:
         # injection before DeepEP/DeepGEMM JIT compilation starts.
         self._detach_nsys_injection_from_subprocesses()
         self._init_afd_runtime()
+
+        # Cold page cache can make EG stage loading minutes slower than AG
+        # loading. Do not let an early AG rank enter DeepEP graph warmup while
+        # another union rank is still loading weights: DeepEP's collective
+        # timeout is shorter than the distributed startup timeout.
+        if (
+            self.enable_decode_graph
+            and self.decode_graph_bs
+            and torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+        ):
+            log_line(
+                self.log_path,
+                f"[{self.role} rank={self.tp_rank}] "
+                "afd_graph_warmup_barrier:start",
+                flush=True,
+            )
+            torch.distributed.barrier()
+            log_line(
+                self.log_path,
+                f"[{self.role} rank={self.tp_rank}] "
+                "afd_graph_warmup_barrier:done",
+                flush=True,
+            )
+
+        # Runtime/model initialization can leave large, releasable blocks in the
+        # CUDA caching allocator. Graph capture needs physical headroom for its
+        # private pools, so mirror the ordinary engine graph lifecycle here.
+        torch.cuda.synchronize(self.device)
+        allocated = torch.cuda.memory_allocated(self.device)
+        reserved_before = torch.cuda.memory_reserved(self.device)
+        torch.cuda.empty_cache()
+        reserved_after = torch.cuda.memory_reserved(self.device)
+        log_line(
+            self.log_path,
+            f"[{self.role} rank={self.tp_rank}] afd_graph_capture_memory_prepared "
+            f"allocated_gib={allocated / (1024**3):.2f} "
+            f"reserved_before_gib={reserved_before / (1024**3):.2f} "
+            f"reserved_after_gib={reserved_after / (1024**3):.2f} "
+            f"released_gib={(reserved_before - reserved_after) / (1024**3):.2f}",
+            flush=True,
+        )
+
         # AG and EG graph capture contains matching collectives, so all ranks
         # self-trigger warmup here before the coordinator starts sending steps.
         self.warmup_afd_decode_graphs(self.decode_graph_bs)
@@ -508,6 +558,9 @@ class BaseAfdWorker:
         else:
             if adapter_lanes > 1:
                 os.environ["MINISGL_DEEPEP_PER_BUFFER_COMM_STREAM"] = "1"
+            deepep_expanded_layout = (
+                str(config.afd_moe_runner_backend) != "flashinfer_nvfp4"
+            )
             self._afd_adapters = [
                 DeepEPM2NAdapter(
                     group=dist.group.WORLD,
@@ -517,6 +570,7 @@ class BaseAfdWorker:
                     hidden_size=int(mc.hidden_size),
                     top_k=int(mc.num_experts_per_tok),
                     num_max_dispatch_tokens_per_rank=bucket,
+                    use_expanded_layout=deepep_expanded_layout,
                 )
                 for _lane in range(adapter_lanes)
             ]
@@ -525,6 +579,7 @@ class BaseAfdWorker:
                 self.log_path,
                 f"[{self.role} rank={self.tp_rank}] afd_deepep_adapters "
                 f"lanes={adapter_lanes} afd_num_mb={int(self.afd_num_mb)} bucket={bucket} "
+                f"expanded_layout={int(deepep_expanded_layout)} "
                 f"per_buffer_comm_stream={os.environ.get('MINISGL_DEEPEP_PER_BUFFER_COMM_STREAM', '0')}",
                 flush=True,
             )
@@ -533,6 +588,7 @@ class BaseAfdWorker:
         # that need FP32 are listed below; everything else follows model dtype.
         is_minimax_m2 = arch0 == "MiniMaxM2ForCausalLM"
         is_glm4_moe = arch0 == "Glm4MoeForCausalLM"
+        is_qwen35 = arch0 == "Qwen3_5MoeForConditionalGeneration"
 
         def _minimax_fp32_key(key: str) -> bool:
             return is_minimax_m2 and (
@@ -546,15 +602,24 @@ class BaseAfdWorker:
                 or key.endswith(".mlp.gate.e_score_correction_bias")
             )
 
+        def _qwen35_fp32_key(key: str) -> bool:
+            return is_qwen35 and (
+                key.endswith(".linear_attn.A_log")
+                or key.endswith("_input_scale")
+                or key.endswith("_weight_scale_2")
+            )
+
         def _cast_full(pairs):
             tgt = config.dtype
             return {
                 k: (
                     v
-                    if v.dtype == torch.float8_e4m3fn
-                    or (v.dtype == torch.float32 and k.endswith("_scale"))
+                    if v.dtype in (torch.uint8, torch.float8_e4m3fn)
                     else v.to(torch.float32)
-                    if _minimax_fp32_key(k) or _glm4_fp32_key(k)
+                    if k.endswith("_scale")
+                    or _minimax_fp32_key(k)
+                    or _glm4_fp32_key(k)
+                    or _qwen35_fp32_key(k)
                     else v.to(tgt)
                 )
                 for k, v in pairs
@@ -569,6 +634,13 @@ class BaseAfdWorker:
                 )
 
                 return Qwen3AfdDenseRouterForCausalLM, Qwen3AfdExpertStage
+            if arch == "Qwen3_5MoeForConditionalGeneration":
+                from minisgl.models.qwen35_moe_afd import (
+                    Qwen3_5AfdDenseRouterForCausalLM,
+                    Qwen3_5AfdExpertStage,
+                )
+
+                return Qwen3_5AfdDenseRouterForCausalLM, Qwen3_5AfdExpertStage
             if arch == "MiniMaxM2ForCausalLM":
                 from minisgl.models.minimax_m2_afd import (
                     MiniMaxM2AfdDenseRouterForCausalLM,
@@ -610,14 +682,14 @@ class BaseAfdWorker:
             )
             model.load_state_dict(extract_stage_state_dict(model, full))
             del full
+            remote_layers = [
+                layer
+                for layer in getattr(model.model.layers, "op_list", [])
+                if hasattr(layer, "mlp") and hasattr(layer.mlp, "experts")
+            ]
             try:
                 sd = model.state_dict()
                 tensor_bytes = sum(int(t.numel() * t.element_size()) for t in sd.values())
-                remote_layers = [
-                    layer
-                    for layer in getattr(model.model.layers, "op_list", [])
-                    if hasattr(layer, "mlp") and hasattr(layer.mlp, "experts")
-                ]
                 shapes = []
                 for idx in (0, len(remote_layers) - 1):
                     if 0 <= idx < len(remote_layers):
@@ -643,6 +715,21 @@ class BaseAfdWorker:
                     self.log_path,
                     f"[{self.role} rank={self.tp_rank}] afd_eg_model_memory_log_failed "
                     f"{type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+            if str(config.afd_moe_runner_backend) == "flashinfer_nvfp4":
+                if not remote_layers:
+                    raise RuntimeError("NVFP4 EG prewarm requires at least one expert layer")
+                experts = remote_layers[0].mlp.experts
+                started = time.perf_counter()
+                experts.runner.prewarm(experts, dtype=config.dtype)
+                torch.cuda.empty_cache()
+                log_line(
+                    self.log_path,
+                    f"[{self.role} rank={self.tp_rank}] afd_nvfp4_prewarm_done "
+                    f"layer=0 elapsed_s={time.perf_counter() - started:.3f} "
+                    f"cuda_alloc_gib={torch.cuda.memory_allocated() / (1024**3):.2f} "
+                    f"cuda_reserved_gib={torch.cuda.memory_reserved() / (1024**3):.2f}",
                     flush=True,
                 )
             if self._afd_moe_backend == "megamoe_m2n":
@@ -897,6 +984,7 @@ class BaseAfdWorker:
             raise
         finally:
             self._hot_loop_running = False
+            self._log_cuda_memory_peak()
             # Finalize profiling here too: if the coordinator is killed before it
             # can call worker.shutdown() (observed with attn_dp>1 multi-node
             # teardown), this is the only place the per-rank cpu_trace + nsys-rep
@@ -938,6 +1026,7 @@ class BaseAfdWorker:
             pass
 
     def shutdown(self) -> None:
+        self._log_cuda_memory_peak()
         self._finalize_profiling()
         for attr in (
             "_recv_from_coordinator",
@@ -947,6 +1036,40 @@ class BaseAfdWorker:
         self._safe_close("runtime", method="shutdown")
         self._destroy_afd_adapters()
         flush_log_lines(self.log_path)
+
+    def _log_cuda_memory_peak(self) -> None:
+        if getattr(self, "_cuda_memory_peak_logged", False):
+            return
+        self._cuda_memory_peak_logged = True
+        try:
+            current_allocated = int(torch.cuda.memory_allocated(self.device))
+            current_reserved = int(torch.cuda.memory_reserved(self.device))
+            peak_allocated = int(torch.cuda.max_memory_allocated(self.device))
+            peak_reserved = int(torch.cuda.max_memory_reserved(self.device))
+            _, total = torch.cuda.mem_get_info(self.device)
+            gib = 1024**3
+            log_line(
+                self.log_path,
+                f"[{self.role} rank={self.tp_rank}] afd_cuda_memory "
+                f"current_allocated_bytes={current_allocated} "
+                f"current_reserved_bytes={current_reserved} "
+                f"peak_allocated_bytes={peak_allocated} "
+                f"peak_reserved_bytes={peak_reserved} "
+                f"device_total_bytes={int(total)} "
+                f"current_allocated_gib={current_allocated / gib:.2f} "
+                f"current_reserved_gib={current_reserved / gib:.2f} "
+                f"peak_allocated_gib={peak_allocated / gib:.2f} "
+                f"peak_reserved_gib={peak_reserved / gib:.2f} "
+                f"device_total_gib={int(total) / gib:.2f}",
+                flush=True,
+            )
+        except Exception as exc:
+            log_line(
+                self.log_path,
+                f"[{self.role} rank={self.tp_rank}] afd_cuda_memory_log_failed "
+                f"{type(exc).__name__}: {exc}",
+                flush=True,
+            )
 
     def _destroy_afd_adapters(self) -> None:
         adapters = list(getattr(self, "_afd_adapters", []))

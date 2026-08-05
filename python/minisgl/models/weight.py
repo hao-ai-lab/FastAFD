@@ -19,6 +19,7 @@ _SPLIT_DIM_1 = [".o_proj", ".down_proj"]
 _FP8_SCALE_SUFFIX = ".weight_scale_inv"
 _FP8_SCALE_SUFFIXES = (".weight_scale_inv", ".weight_scale")
 _SCALE_RENAME_SUFFIX = "_scale"
+_NVFP4_GLOBAL_SCALE_SUFFIXES = (".input_scale", ".weight_scale_2")
 
 # Merge groups: individual projections -> fused projection
 _MERGE_GROUPS = {
@@ -62,6 +63,39 @@ def _is_glm4_moe_config(config: Any) -> bool:
     return "Glm4MoeForCausalLM" in archs or _config_field(
         config, "model_type", default=""
     ) == "glm4_moe"
+
+
+def _is_qwen35_config(config: Any) -> bool:
+    archs = _config_field(config, "architectures", default=[]) or []
+    return (
+        "Qwen3_5MoeForConditionalGeneration" in archs
+        or _config_field(config, "model_type", default="")
+        in {"qwen3_5", "qwen3_5_moe", "qwen3_5_moe_text"}
+    )
+
+
+def _normalize_checkpoint_key(raw_name: str, config: Any) -> str | None:
+    """Map an HF checkpoint key to mini-sgl's text-model namespace.
+
+    Qwen3.5 wraps the language model below ``model.language_model``. Vision,
+    MTP, and calibrated FP8-KV scale tensors are intentionally outside the
+    current text/BF16-KV runtime contract.
+    """
+
+    if raw_name.startswith(("vision_tower.", "multi_modal_projector.")):
+        return None
+    if _is_qwen35_config(config):
+        if raw_name.startswith(("model.visual.", "visual.", "mtp.", "model.mtp.")):
+            return None
+        if raw_name.endswith((".k_proj.k_scale", ".v_proj.v_scale")):
+            return None
+        if raw_name.startswith("model.language_model."):
+            raw_name = "model." + raw_name.removeprefix("model.language_model.")
+        elif raw_name.startswith("language_model."):
+            raw_name = raw_name.removeprefix("language_model.")
+    else:
+        raw_name = raw_name.removeprefix("language_model.")
+    return _rename_checkpoint_key(raw_name)
 
 
 def _glm4_layer_index_for_key(key: str) -> int | None:
@@ -119,6 +153,92 @@ def _shard_tensor(
         return value[vocab_start_idx:vocab_end_idx, :].clone()
     else:
         return value
+
+
+def _shard_qwen35_linear_tensor(
+    key: str,
+    value: torch.Tensor,
+    r: int,
+    n: int,
+    config: Any,
+    *,
+    fp8_block_size: Optional[Tuple[int, int]] = None,
+) -> torch.Tensor | None:
+    """Shard Qwen3.5 GDN tensors whose names do not match generic QKV rules."""
+
+    marker = ".linear_attn."
+    if marker not in key:
+        return None
+    key_dim = int(config.linear_num_key_heads) * int(config.linear_key_head_dim)
+    value_dim = int(config.linear_num_value_heads) * int(
+        config.linear_value_head_dim
+    )
+
+    if key.endswith(".in_proj_qkv.weight_scale"):
+        if fp8_block_size is None:
+            return None
+        block_out = int(fp8_block_size[0])
+        if key_dim % block_out or value_dim % block_out:
+            raise ValueError(
+                "Qwen3.5 fused GDN FP8 scale requires block-aligned logical "
+                f"projections, got key={key_dim}, value={value_dim}, block={block_out}"
+            )
+        key_blocks = key_dim // block_out
+        value_blocks = value_dim // block_out
+        q, k, v = value.split((key_blocks, key_blocks, value_blocks), dim=0)
+        return torch.cat(
+            (
+                q.chunk(n, dim=0)[r],
+                k.chunk(n, dim=0)[r],
+                v.chunk(n, dim=0)[r],
+            ),
+            dim=0,
+        ).clone()
+    if key.endswith(
+        (
+            ".in_proj_z.weight_scale",
+            ".in_proj_a.weight_scale",
+            ".in_proj_b.weight_scale",
+        )
+    ):
+        if fp8_block_size is None:
+            return None
+        return _slice_fp8_scale_dim(
+            value,
+            dim=0,
+            r=r,
+            n=n,
+            block_size=int(fp8_block_size[0]),
+        )
+    if key.endswith(".out_proj.weight_scale"):
+        if fp8_block_size is None:
+            return None
+        return _slice_fp8_scale_dim(
+            value,
+            dim=1,
+            r=r,
+            n=n,
+            block_size=int(fp8_block_size[1]),
+        )
+    if key.endswith((".in_proj_qkv.weight", ".conv1d.weight")):
+        q, k, v = value.split((key_dim, key_dim, value_dim), dim=0)
+        return torch.cat(
+            (q.chunk(n, dim=0)[r], k.chunk(n, dim=0)[r], v.chunk(n, dim=0)[r]),
+            dim=0,
+        ).clone()
+    if key.endswith(
+        (
+            ".in_proj_z.weight",
+            ".in_proj_a.weight",
+            ".in_proj_b.weight",
+            ".A_log",
+            ".dt_bias",
+        )
+    ):
+        return value.chunk(n, dim=0)[r].clone()
+    if key.endswith(".out_proj.weight"):
+        return value.chunk(n, dim=1)[r].clone()
+    return None
 
 
 def _slice_fp8_scale_dim(
@@ -185,6 +305,55 @@ def _shard_fp8_channel_scale_tensor(
     # Per-channel FP8 scales are per output row. Row-parallel weights shard
     # input columns, so their row scales are replicated.
     return value
+
+
+def _shard_nvfp4_tensor(
+    key: str,
+    value: torch.Tensor,
+    r: int,
+    n: int,
+    num_kv_heads: int,
+    *,
+    group_size: int,
+    skip_tp_shard: bool = False,
+) -> torch.Tensor:
+    """Shard a ModelOpt NVFP4 tensor in its serialized packed layout."""
+
+    if skip_tp_shard:
+        return value
+    if key.endswith(_NVFP4_GLOBAL_SCALE_SUFFIXES):
+        return value
+    if key.endswith(".weight_scale"):
+        return _shard_fp8_scale_tensor(
+            key,
+            value,
+            r,
+            n,
+            num_kv_heads,
+            (1, int(group_size)),
+        )
+    return _shard_tensor(key, value, r, n, num_kv_heads)
+
+
+def _nvfp4_runtime_parameter_name(name: str) -> str:
+    """Map ModelOpt projection suffixes to flat MoELayer tensor attributes."""
+
+    for checkpoint_suffix, runtime_suffix in (
+        (".weight_scale_2", "_weight_scale_2"),
+        (".input_scale", "_input_scale"),
+        (".weight_scale", "_scale"),
+    ):
+        if name.endswith(checkpoint_suffix):
+            return name.removesuffix(checkpoint_suffix) + runtime_suffix
+    return name
+
+
+def _merge_projection_parts(parts: list[torch.Tensor]) -> torch.Tensor:
+    """Merge projection tensors, including scalar ModelOpt global scales."""
+
+    if not parts:
+        raise ValueError("cannot merge an empty projection group")
+    return torch.stack(parts, dim=0) if parts[0].dim() == 0 else torch.cat(parts, dim=0)
 
 
 def _find_paired_scale_key(
@@ -308,23 +477,26 @@ def load_weight(
         else None
     )
     fp8_channel_scale = config.quant is not None and config.quant.method == "fp8_channel"
+    is_nvfp4 = config.quant is not None and config.quant.method == "modelopt_nvfp4"
+    nvfp4_group_size = int(config.quant.group_size or 16) if is_nvfp4 else 0
     logger.info(
         f"Loading weights from {len(files)} safetensors files"
         + (f" (FP8 block={fp8_block_size})" if fp8_block_size else "")
         + (" (FP8 channel)" if fp8_channel_scale else "")
+        + (f" (ModelOpt NVFP4 group={nvfp4_group_size})" if is_nvfp4 else "")
     )
 
     # Buffer for merge groups: merged_key -> {slot: tensor}
     merge_buf: Dict[str, Dict[str, torch.Tensor]] = {}
     expert_buf: Dict[str, Dict[int, torch.Tensor]] = {}
+    nvfp4_input_scale_max: Dict[str, torch.Tensor] = {}
     for file in tqdm(files, desc="Loading weights", disable=not tp_info.is_primary()):
         with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
             shard_keys = set(f.keys())
             for raw_name in f.keys():
-                # Strip multimodal wrapper prefix, skip vision/projector weights
-                if raw_name.startswith(("vision_tower.", "multi_modal_projector.")):
+                name = _normalize_checkpoint_key(raw_name, config)
+                if name is None:
                     continue
-                name = raw_name.removeprefix("language_model.")
                 if _is_glm4_moe_config(config) and _glm4_is_expected_nextn_key(name, config):
                     continue
 
@@ -343,18 +515,26 @@ def load_weight(
                 if is_scale_tensor:
                     assert scale_suffix is not None
                     base_weight_name = name.removesuffix(scale_suffix)
-                    if fp8_block_size is None and not fp8_channel_scale:
+                    if fp8_block_size is None and not fp8_channel_scale and not is_nvfp4:
                         continue
-                    name = (
-                        base_weight_name + _SCALE_RENAME_SUFFIX
-                        if _is_expert_key(base_weight_name)
-                        else base_weight_name + ".weight_scale"
-                    )
-                name = _rename_checkpoint_key(name)
-
+                    if is_nvfp4 and _is_expert_key(base_weight_name):
+                        name = _nvfp4_runtime_parameter_name(name)
+                    else:
+                        name = (
+                            base_weight_name + _SCALE_RENAME_SUFFIX
+                            if _is_expert_key(base_weight_name)
+                            else base_weight_name + ".weight_scale"
+                        )
                 pre_merge_expert_info = (
                     _get_expert_stack_info(name) if config.is_moe else None
                 )
+                is_nvfp4_input_scale = bool(
+                    is_nvfp4
+                    and pre_merge_expert_info is not None
+                    and name.endswith(".input_scale")
+                )
+                if is_nvfp4 and pre_merge_expert_info is not None:
+                    name = _nvfp4_runtime_parameter_name(name)
                 is_remote_shared_expert = _is_remote_shared_expert_key(name, config)
                 # afd AG/EG role split: drop the other role's weights.
                 if skip_expert_weights and (
@@ -365,7 +545,11 @@ def load_weight(
                     pre_merge_expert_info is None and not is_remote_shared_expert
                 ):
                     continue
-                if local_expert_partition is not None and pre_merge_expert_info is not None:
+                if (
+                    local_expert_partition is not None
+                    and pre_merge_expert_info is not None
+                    and not is_nvfp4_input_scale
+                ):
                     _, expert_idx = pre_merge_expert_info
                     if not (
                         local_expert_partition.start_idx
@@ -374,7 +558,44 @@ def load_weight(
                     ):
                         continue
                 raw = f.get_tensor(raw_name)
-                if fp8_channel_scale and is_scale_tensor:
+                if is_nvfp4_input_scale:
+                    assert pre_merge_expert_info is not None
+                    packed_input_key, _ = pre_merge_expert_info
+                    packed_input_key = _nvfp4_runtime_parameter_name(packed_input_key)
+                    input_scale = raw.float()
+                    previous = nvfp4_input_scale_max.get(packed_input_key)
+                    nvfp4_input_scale_max[packed_input_key] = (
+                        input_scale
+                        if previous is None
+                        else torch.maximum(previous, input_scale)
+                    )
+                    del raw
+                    continue
+                qwen35_linear_tensor = (
+                    _shard_qwen35_linear_tensor(
+                        name,
+                        raw,
+                        tp_info.rank,
+                        tp_info.size,
+                        config,
+                        fp8_block_size=fp8_block_size,
+                    )
+                    if _is_qwen35_config(config)
+                    else None
+                )
+                if qwen35_linear_tensor is not None:
+                    tensor = qwen35_linear_tensor
+                elif is_nvfp4 and pre_merge_expert_info is not None:
+                    tensor = _shard_nvfp4_tensor(
+                        _normalize_checkpoint_key(raw_name, config) or name,
+                        raw,
+                        tp_info.rank,
+                        tp_info.size,
+                        config.num_kv_heads,
+                        group_size=nvfp4_group_size,
+                        skip_tp_shard=(local_expert_partition is not None),
+                    )
+                elif fp8_channel_scale and is_scale_tensor:
                     tensor = _shard_fp8_channel_scale_tensor(
                         name,
                         raw,
@@ -431,7 +652,7 @@ def load_weight(
                         continue
                     parts = [merge_buf[merged_key][s] for s in all_slots]
                     del merge_buf[merged_key]
-                    out = (merged_key, torch.cat(parts, dim=0))
+                    out = (merged_key, _merge_projection_parts(parts))
 
                 if config.is_moe and (expert_info := _get_expert_stack_info(out[0])) is not None:
                     packed_key, expert_idx = expert_info
@@ -455,12 +676,27 @@ def load_weight(
                         experts = [slots.get(idx, zero) for idx in range(local_num_experts)]
                     del expert_buf[packed_key]
                     stacked = torch.stack(experts, dim=0)
-                    if packed_key.endswith(_SCALE_RENAME_SUFFIX):
+                    if packed_key.endswith(_SCALE_RENAME_SUFFIX) and not is_nvfp4:
                         stacked = stacked.to(torch.float32)
                     yield packed_key, stacked
                 else:  # Normal dense model
                     yield out[0], out[1]
 
+    nvfp4_input_merge: Dict[str, Dict[str, torch.Tensor]] = {}
+    for key, scale in nvfp4_input_scale_max.items():
+        if (info := _get_merge_info(key)) is None:
+            yield key, scale
+            continue
+        merged_key, slot, all_slots = info
+        slots = nvfp4_input_merge.setdefault(merged_key, {})
+        slots[slot] = scale
+        if all(name in slots for name in all_slots):
+            yield merged_key, torch.stack([slots[name] for name in all_slots])
+            del nvfp4_input_merge[merged_key]
+
     assert not merge_buf, f"Incomplete merge groups in checkpoint: {list(merge_buf.keys())}"
     assert not expert_buf, f"Incomplete expert tensors in checkpoint: {list(expert_buf.keys())}"
+    assert not nvfp4_input_merge, (
+        f"Incomplete NVFP4 input-scale merge groups: {list(nvfp4_input_merge.keys())}"
+    )
     logger.info("Finished loading weights")

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from .base import MoeA2ABackend, MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from .deepgemm_grouped import DeepGEMMGroupedRunner
+from .flashinfer_nvfp4 import FlashInferNvFp4Runner
 from .triton import TritonRunner
 from .triton_fp8 import TritonFp8Runner
 
@@ -17,6 +18,8 @@ def create_moe_runner(
         return TritonFp8Runner(config=moe_runner_config)
     if backend.is_deep_gemm():
         return DeepGEMMGroupedRunner(config=moe_runner_config)
+    if backend.is_flashinfer_nvfp4():
+        return FlashInferNvFp4Runner(config=moe_runner_config)
     if backend.is_triton_kernels():
         raise NotImplementedError(
             "runner_backend='triton_kernel' is not implemented in the no-DeepEP EP port"
@@ -30,6 +33,7 @@ __all__ = [
     "MoeRunnerBackend",
     "MoeRunnerConfig",
     "DeepGEMMGroupedRunner",
+    "FlashInferNvFp4Runner",
     "TritonRunner",
     "TritonFp8Runner",
     "create_moe_runner",

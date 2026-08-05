@@ -62,6 +62,9 @@ class DeepEPDispatcher(BaseDispatcher):
         self.num_experts = int(moe_runner_config.num_experts or 0)
         self.num_local_experts = int(moe_runner_config.num_local_experts or 0)
         self.top_k = int(moe_runner_config.top_k or 0)
+        self.use_expanded_layout = (
+            str(moe_runner_config.runner_backend) != "flashinfer_nvfp4"
+        )
         self._group_expert_map: torch.Tensor | None = None
 
     @staticmethod
@@ -159,8 +162,13 @@ class DeepEPDispatcher(BaseDispatcher):
                 group_topk_ids.contiguous(),
                 topk_weights.contiguous(),
                 hidden_states_scale=dispatch_x_scale,
-                expert_alignment=self._deepgemm_expert_alignment(),
+                expert_alignment=(
+                    self._deepgemm_expert_alignment()
+                    if self.use_expanded_layout
+                    else 1
+                ),
                 num_max_dispatch_tokens_per_rank=ctx.moe_deepep_dispatch_max_tokens_per_rank,
+                use_expanded_layout=self.use_expanded_layout,
             )
             return DeepEPElasticDispatchOutput(
                 hidden_states=recv_x,
@@ -205,6 +213,34 @@ def _pre_permute_deepep_elastic_to_deep_gemm(
 
 @register_post_permute("deep_gemm", "deepep_elastic")
 def _post_permute_runner_to_deepep_elastic(
+    runner_output: torch.Tensor,
+    dispatch_output: DeepEPElasticDispatchOutput,
+) -> DeepEPElasticCombineInput:
+    return DeepEPElasticCombineInput(
+        hidden_states=runner_output,
+        handle=dispatch_output.handle,
+    )
+
+
+@register_pre_permute("deepep_elastic", "flashinfer_nvfp4")
+def _pre_permute_deepep_elastic_to_flashinfer_nvfp4(
+    dispatch_output: DeepEPElasticDispatchOutput,
+) -> DeepEPElasticDispatchOutput:
+    if dispatch_output.topk_ids is None or dispatch_output.topk_weights is None:
+        raise RuntimeError(
+            "FlashInfer NVFP4 requires DeepEP non-expanded top-k metadata"
+        )
+    if dispatch_output.topk_ids.ndim != 2 or dispatch_output.topk_weights.ndim != 2:
+        raise RuntimeError(
+            "FlashInfer NVFP4 requires 2D DeepEP top-k ids and weights"
+        )
+    if dispatch_output.hidden_states_scale is not None:
+        raise RuntimeError("FlashInfer NVFP4 DeepEP transport requires BF16 activations")
+    return dispatch_output
+
+
+@register_post_permute("flashinfer_nvfp4", "deepep_elastic")
+def _post_permute_flashinfer_nvfp4_to_deepep_elastic(
     runner_output: torch.Tensor,
     dispatch_output: DeepEPElasticDispatchOutput,
 ) -> DeepEPElasticCombineInput:

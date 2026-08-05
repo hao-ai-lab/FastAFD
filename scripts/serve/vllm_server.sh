@@ -99,7 +99,21 @@ export PYTHONUNBUFFERED=1
 # Mirror the mini-sgl clean-shell defaults so ad-hoc runs don't depend on
 # the caller having pre-exported the toolchain env.
 if [[ -n "${CONDA_PREFIX:-}" ]]; then
-  if [[ -z "${CUDA_HOME:-}" && -x "${CONDA_PREFIX}/bin/nvcc" ]]; then
+  CUDA_TARGET_ROOT="${CONDA_PREFIX}/targets/sbsa-linux"
+  if [[ -f "${CUDA_TARGET_ROOT}/include/cuda_bf16.h" ]]; then
+    # CUDA 13 Conda packages keep headers/binaries at the prefix and expose
+    # target libraries through $CONDA_PREFIX/lib64. Pointing CUDA_HOME at the
+    # sbsa target directly makes FlashInfer link against a non-existent
+    # targets/sbsa-linux/lib64 directory during a cold JIT build.
+    export CUDA_HOME="${CONDA_PREFIX}"
+    export CUDA_PATH="${CONDA_PREFIX}"
+    export FLASHINFER_NVCC="${FLASHINFER_NVCC:-${CONDA_PREFIX}/bin/nvcc}"
+    export PATH="${CONDA_PREFIX}/nvvm/bin:${CONDA_PREFIX}/bin:${CUDA_TARGET_ROOT}/bin:${PATH}"
+    if [[ -n "${FLASHINFER_WORKSPACE_BASE:-}" && \
+          "${FLASHINFER_WORKSPACE_BASE##*/}" != "cuda-target-sbsa-linux" ]]; then
+      export FLASHINFER_WORKSPACE_BASE="${FLASHINFER_WORKSPACE_BASE%/}/cuda-target-sbsa-linux"
+    fi
+  elif [[ -z "${CUDA_HOME:-}" && -x "${CONDA_PREFIX}/bin/nvcc" ]]; then
     export CUDA_HOME="${CONDA_PREFIX}"
   fi
   if [[ -z "${CUDA_PATH:-}" && -n "${CUDA_HOME:-}" ]]; then

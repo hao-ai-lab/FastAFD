@@ -334,6 +334,32 @@ class LinearQKVMerged(_LinearTPImpl):
         self._use_bf16_cublas_for_fp8 = False
 
 
+class LinearQKVGatedMerged(_LinearTPImpl):
+    """QKV projection whose Q rows carry per-head query and output gate."""
+
+    def __init__(
+        self,
+        hidden_size: int,
+        head_dim: int,
+        num_qo_heads: int,
+        num_kv_heads: int,
+        has_bias: bool,
+        quant: Any | None = None,
+    ):
+        tp_info = get_tp_info()
+        local_num_qo = div_even(num_qo_heads, tp_info.size)
+        local_num_kv = div_even(num_kv_heads, tp_info.size, allow_replicate=True)
+        super().__init__(
+            hidden_size,
+            (2 * num_qo_heads + 2 * num_kv_heads) * head_dim,
+            hidden_size,
+            (2 * local_num_qo + 2 * local_num_kv) * head_dim,
+            has_bias,
+            quant=quant,
+        )
+        self._use_bf16_cublas_for_fp8 = False
+
+
 class LinearOProj(_LinearTPImpl):
     def __init__(
         self,

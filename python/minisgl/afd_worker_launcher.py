@@ -136,6 +136,7 @@ def startup_afd_workers(coord: Any) -> None:
         "device_comm_num_sms": coord.device_comm_num_sms,
         "ray_nsys": bool(coord.server_args.ray_nsys),
         "disable_overlap": bool(coord.server_args.afd_disable_overlap),
+        "async_pending_steps": int(coord.async_pending_steps),
         "afd_num_mb": coord.afd_num_mb,
         "rpc_timeout_ms": coord._rpc_timeout_ms,
         "moe_a2a_backend": coord.server_args.afd_moe_a2a_backend,

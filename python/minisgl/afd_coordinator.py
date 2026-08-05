@@ -131,6 +131,9 @@ class AfdCoordinator:
             raise RuntimeError("--afd-max-batched-tokens must be >= 1")
         self.max_seq_len = int(server_args.max_seq_len)
         self.device_comm_num_sms = max(1, int(server_args.afd_device_comm_num_sms))
+        self.async_pending_steps = max(
+            2, int(server_args.afd_async_pending_steps)
+        )
         if str(server_args.cache_type) != "naive":
             raise RuntimeError(
                 "AFD serve uses the centralized scheduler and currently supports only cache_type='naive'"
@@ -243,8 +246,13 @@ class AfdCoordinator:
         self._afd_reply_tokens_by_dp: dict[int, dict[int, list[int]]] = {}
         self._shutdown_requested = False
         self._nsys_runtime_started = False
+        self._nsys_runtime_finished = False
         self._nsys_start_step = max(0, _env_int("MINISGL_RAY_NSYS_START_STEP", 0))
         self._nsys_stop_step = max(0, _env_int("MINISGL_RAY_NSYS_STOP_STEP", 0))
+        self._shutdown_timeout_s = max(
+            5.0,
+            float(_env_int("MINISGL_AFD_SHUTDOWN_TIMEOUT_S", 30)),
+        )
         self._thread: threading.Thread | None = None
         self._failure: str | None = None
 
@@ -474,6 +482,8 @@ class AfdCoordinator:
             f"attention_backend={self.attention_backend} "
             f"max_batched_tokens={self.max_batched_tokens} "
             f"decode_graph_bs={list(self.decode_graph_bs)} "
+            f"disable_overlap={bool(self.server_args.afd_disable_overlap)} "
+            f"async_pending_steps={self.async_pending_steps} "
             f"centralized_scheduler=True",
             flush=True,
         )
@@ -560,11 +570,11 @@ class AfdCoordinator:
                 lambda: self._broadcast_cmd_to_workers(AfdStopCmd()),
             )
         if self._thread is not None:
-            self._thread.join(timeout=5.0)
+            self._thread.join(timeout=self._shutdown_timeout_s)
         if self._worker_hot_loop_refs:
             self._shutdown_call(
                 "wait_worker_hot_loops",
-                lambda: ray.get(self._worker_hot_loop_refs, timeout=5.0),
+                self._wait_for_worker_hot_loops,
             )
             self._worker_hot_loop_refs = []
         if self._nsys_runtime_started:
@@ -597,6 +607,12 @@ class AfdCoordinator:
         if trace_path:
             log_line(self.log_path, f"[afd-coordinator] cpu_trace flushed path={trace_path}", flush=True)
         flush_log_lines(self.log_path)
+
+    def _wait_for_worker_hot_loops(self) -> None:
+        ray.get(
+            self._worker_hot_loop_refs,
+            timeout=self._shutdown_timeout_s,
+        )
 
     def _init_centralized_schedulers(self) -> None:
         if not self.attn_workers:
@@ -1206,7 +1222,7 @@ class AfdCoordinator:
         scheds = self._central_schedulers
         attn_tp = int(self.attn_tp_size)
         forward_remains = [_AfdForwardRemain() for _ in range(n_dp)]
-        max_pending = 3
+        max_pending = self.async_pending_steps
         log_line(
             self.log_path,
             f"[afd-overlap] mode=dp_lockstep_fixed_lead n_dp={n_dp} "

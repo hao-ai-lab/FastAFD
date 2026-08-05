@@ -15,13 +15,16 @@ This runs a sequential online AFD-vs-vLLM alignment pipeline:
 
 Options:
   --env NAME                  Expected active conda env. Default: minisgl-cuda130
+  --vllm-env NAME             Conda env used only for vLLM. Defaults to --env.
   --model PATH                Model path or HF repo. Required.
+  --vllm-model PATH           Optional vLLM-only model path. Defaults to --model.
   --prompt-file FILE          UTF-8 prompt file. Required.
   --prompt-repeat N           Repeat prompt set in memory. Default: 1
   --batch-size N              AFD online batch size. Default: 8
   --max-new-tokens N          Sampling max new tokens. Default: 1
   --cuda-graph-max-bs N       AFD decode graph cap. Default: batch size
   --decode-graph-bs CSV       Optional static AFD decode graph buckets
+  --afd-num-mb N              AFD microbatches per step. Default: 1
   --max-batched-tokens N      Static eager prefill token budget / comm buffer sizing. Default: 8192
   --cache-type NAME           KV cache manager strategy for AFD. Default: naive
   --gpus CSV                  CUDA_VISIBLE_DEVICES for vLLM. Default: 0,1,2,3
@@ -217,13 +220,16 @@ log_step() {
 }
 
 ENV_NAME="minisgl-cuda130"
+VLLM_ENV_NAME=""
 MODEL=""
+VLLM_MODEL=""
 PROMPT_FILE=""
 PROMPT_REPEAT="1"
 AFD_BATCH_SIZE="8"
 MAX_NEW_TOKENS="1"
 AFD_CUDA_GRAPH_MAX_BS=""
 AFD_DECODE_GRAPH_BS=""
+AFD_NUM_MB="1"
 AFD_MAX_BATCHED_TOKENS="8192"
 AFD_MAX_RUNNING_REQUESTS="0"
 CACHE_TYPE="naive"
@@ -264,13 +270,16 @@ VLLM_PID=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --env) ENV_NAME="$2"; shift 2 ;;
+    --vllm-env) VLLM_ENV_NAME="$2"; shift 2 ;;
     --model) MODEL="$2"; shift 2 ;;
+    --vllm-model) VLLM_MODEL="$2"; shift 2 ;;
     --prompt-file) PROMPT_FILE="$2"; shift 2 ;;
     --prompt-repeat) PROMPT_REPEAT="$2"; shift 2 ;;
     --batch-size) AFD_BATCH_SIZE="$2"; shift 2 ;;
     --max-new-tokens) MAX_NEW_TOKENS="$2"; shift 2 ;;
     --cuda-graph-max-bs) AFD_CUDA_GRAPH_MAX_BS="$2"; shift 2 ;;
     --decode-graph-bs) AFD_DECODE_GRAPH_BS="$2"; shift 2 ;;
+    --afd-num-mb) AFD_NUM_MB="$2"; shift 2 ;;
     --max-batched-tokens) AFD_MAX_BATCHED_TOKENS="$2"; shift 2 ;;
     --afd-max-running-requests) AFD_MAX_RUNNING_REQUESTS="$2"; shift 2 ;;
     --cache-type) CACHE_TYPE="$2"; shift 2 ;;
@@ -308,11 +317,21 @@ done
 if [[ -z "$AFD_CUDA_GRAPH_MAX_BS" ]]; then
   AFD_CUDA_GRAPH_MAX_BS="$AFD_BATCH_SIZE"
 fi
+if (( AFD_NUM_MB < 1 )); then
+  echo "--afd-num-mb must be >= 1, got: $AFD_NUM_MB" >&2
+  exit 1
+fi
 
 if [[ -z "$MODEL" || -z "$PROMPT_FILE" ]]; then
   echo "--model and --prompt-file are required" >&2
   usage >&2
   exit 1
+fi
+if [[ -z "$VLLM_MODEL" ]]; then
+  VLLM_MODEL="$MODEL"
+fi
+if [[ -z "$VLLM_ENV_NAME" ]]; then
+  VLLM_ENV_NAME="$ENV_NAME"
 fi
 
 if [[ ! -f "$PROMPT_FILE" ]]; then
@@ -411,12 +430,15 @@ cd "$CALIB_DIR"
 
 log_step "Starting online AFD server"
 echo "  model: $MODEL"
+echo "  vllm_model: $VLLM_MODEL"
+echo "  vllm_env: $VLLM_ENV_NAME"
 echo "  prompt_file: $PROMPT_FILE"
 echo "  prompt_repeat: $PROMPT_REPEAT"
 echo "  afd_batch_size: $AFD_BATCH_SIZE"
 echo "  max_new_tokens: $MAX_NEW_TOKENS"
 echo "  afd_cuda_graph_max_bs: $AFD_CUDA_GRAPH_MAX_BS"
 echo "  afd_decode_graph_bs: ${AFD_DECODE_GRAPH_BS:-<auto>}"
+echo "  afd_num_mb: $AFD_NUM_MB"
 echo "  afd_max_batched_tokens: $AFD_MAX_BATCHED_TOKENS"
 echo "  afd_max_running_requests: ${AFD_MAX_RUNNING_REQUESTS:-0}"
 echo "  afd_mlp_ep_size: $AFD_MLP_EP_SIZE"
@@ -480,6 +502,7 @@ afd_start_cmd+=(
   --cache-type "$CACHE_TYPE"
   --page-size "$PAGE_SIZE"
   --cuda-graph-max-bs "$AFD_CUDA_GRAPH_MAX_BS"
+  --afd-num-mb "$AFD_NUM_MB"
   --afd-device-comm-num-sms "$AFD_DEVICE_COMM_NUM_SMS"
 )
 if [[ -n "$AFD_DECODE_GRAPH_BS" ]]; then
@@ -495,7 +518,12 @@ fi
 "${afd_start_cmd[@]}" >"$AFD_LOG" 2>&1 &
 AFD_PID=$!
 
-if ! wait_for_ready "http://${SERVER_HOST}:${AFD_PORT}/v1/models" "AFD" "$AFD_LOG" "$AFD_PID"; then
+if ! wait_for_ready \
+  "http://${SERVER_HOST}:${AFD_PORT}/v1/models" \
+  "AFD" \
+  "$AFD_LOG" \
+  "$AFD_PID" \
+  "${AFD_READY_TIMEOUT:-900}"; then
   status="$?"
   if [[ "$status" == "2" ]]; then
     fail_with_logs "AFD exited before becoming ready" 1 "$AFD_LOG"
@@ -515,7 +543,7 @@ sample_cmd=(
   --top-p 1
   --top-k 1
   --sample-concurrency "$SAMPLE_CONCURRENCY"
-  --timeout 600
+  --timeout "${AFD_SAMPLE_TIMEOUT:-600}"
   --sample-json "$SAMPLE_JSON"
 )
 if [[ "$BATCH_SUBMIT" -eq 1 ]]; then
@@ -537,19 +565,32 @@ wait "$AFD_PID" >/dev/null 2>&1 || true
 AFD_PID=""
 
 log_step "Starting vLLM"
-"$SCRIPT_ROOT/serve/vllm_server.sh" \
-  --env "$ENV_NAME" \
-  --model "$MODEL" \
-  --gpus "$GPUS" \
-  --port "$VLLM_PORT" \
-  --host "$SERVER_HOST" \
-  --tp-size "$VLLM_TP_SIZE" \
-  --max-model-len "$VLLM_MAX_MODEL_LEN" \
-  --extra-args "$VLLM_EXTRA_ARGS" \
-  >"$VLLM_LOG" 2>&1 &
+vllm_start_cmd=(
+  "$SCRIPT_ROOT/serve/vllm_server.sh"
+  --env "$VLLM_ENV_NAME"
+  --model "$VLLM_MODEL"
+  --gpus "$GPUS"
+  --port "$VLLM_PORT"
+  --host "$SERVER_HOST"
+  --tp-size "$VLLM_TP_SIZE"
+  --max-model-len "$VLLM_MAX_MODEL_LEN"
+  --extra-args "$VLLM_EXTRA_ARGS"
+)
+if [[ "$VLLM_ENV_NAME" != "$ENV_NAME" ]]; then
+  vllm_start_cmd=(
+    conda run --no-capture-output -n "$VLLM_ENV_NAME"
+    "${vllm_start_cmd[@]}"
+  )
+fi
+"${vllm_start_cmd[@]}" >"$VLLM_LOG" 2>&1 &
 VLLM_PID=$!
 
-if ! wait_for_ready "http://${SERVER_HOST}:${VLLM_PORT}/v1/models" "vLLM" "$VLLM_LOG" "$VLLM_PID"; then
+if ! wait_for_ready \
+  "http://${SERVER_HOST}:${VLLM_PORT}/v1/models" \
+  "vLLM" \
+  "$VLLM_LOG" \
+  "$VLLM_PID" \
+  "${VLLM_READY_TIMEOUT:-900}"; then
   status="$?"
   if [[ "$status" == "2" ]]; then
     fail_with_logs "vLLM exited before becoming ready" 1 "$VLLM_LOG"
@@ -562,7 +603,7 @@ if ! python "$SCRIPT_ROOT/validate/compare_minisgl_vllm.py" score \
   --sample-json "$SAMPLE_JSON" \
   --vllm-url "http://${SERVER_HOST}:${VLLM_PORT}" \
   --prompt-logprobs "$PROMPT_LOGPROBS" \
-  --timeout 600 \
+  --timeout "${VLLM_SCORE_TIMEOUT:-600}" \
   --output-json "$REPORT_JSON" \
   >"$TMP_DIR/score.log" 2>&1; then
   fail_with_logs "vLLM scoring failed" 1 "$TMP_DIR/score.log" "$VLLM_LOG"

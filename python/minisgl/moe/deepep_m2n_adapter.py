@@ -50,6 +50,7 @@ class DeepEPM2NAdapter:
         hidden_size: int,
         top_k: int,
         num_max_dispatch_tokens_per_rank: int,
+        use_expanded_layout: bool = True,
         log: Callable[[str], None] | None = None,
     ) -> None:
         if not dist.is_initialized():
@@ -75,6 +76,7 @@ class DeepEPM2NAdapter:
         self.is_eg = not self.is_ag
         self.hidden_size = int(hidden_size)
         self.top_k = int(top_k)
+        self.use_expanded_layout = bool(use_expanded_layout)
         self.num_max_dispatch_tokens_per_rank = int(num_max_dispatch_tokens_per_rank)
         self._deepep_expert_map_by_device: dict[tuple[str, int | None, str], torch.Tensor] = {}
         if self.hidden_size <= 0:
@@ -183,9 +185,14 @@ class DeepEPM2NAdapter:
             deepep_topk_ids.contiguous(),
             real_topk_weights.float().contiguous(),
             hidden_states_scale=hidden_states_scale,
-            expert_alignment=self._resolve_expert_alignment(expert_alignment),
+            expert_alignment=(
+                self._resolve_expert_alignment(expert_alignment)
+                if self.use_expanded_layout
+                else 1
+            ),
             num_max_dispatch_tokens_per_rank=effective_max_tokens,
             do_cpu_sync=bool(do_cpu_sync),
+            use_expanded_layout=self.use_expanded_layout,
         )
         if recv_topk_weights is not None and int(recv_topk_weights.shape[0]) > int(recv_x.shape[0]):
             recv_topk_weights = recv_topk_weights[: recv_x.shape[0]]
@@ -216,7 +223,7 @@ class DeepEPM2NAdapter:
             if topk_weights is not None:
                 raise RuntimeError(
                     "DeepEP M2N combine must not receive topk_weights; "
-                    "the M2N DeepGEMM path applies expanded top-k weights before combine"
+                    "the expert runner applies routed top-k weights before combine"
                 )
             handle = dispatch_output.handle
         else:

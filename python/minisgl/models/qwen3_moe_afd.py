@@ -84,7 +84,7 @@ def qwen3_afd_topk(
             dispatch_fp8=dispatch_fp8,
         )
 
-    from minisgl.kernel import topk_gating
+    from minisgl.kernel import topk_softmax
 
     num_tokens = router_logits.shape[0]
     weights = torch.empty(
@@ -97,11 +97,10 @@ def qwen3_afd_topk(
         dtype=torch.int32,
         device=router_logits.device,
     )
-    topk_gating(
+    topk_softmax(
         weights,
         ids,
         router_logits.contiguous(),
-        scoring="softmax",
         renormalize=renormalize,
     )
     return Qwen3AfdTopK(

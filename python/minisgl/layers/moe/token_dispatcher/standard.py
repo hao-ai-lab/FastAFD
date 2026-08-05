@@ -122,4 +122,20 @@ def _post_permute_triton_fp8_to_standard(
     return StandardCombineInput(hidden_states=runner_output)
 
 
+@register_pre_permute("standard", "flashinfer_nvfp4")
+def _pre_permute_standard_to_flashinfer_nvfp4(
+    dispatch_output: StandardDispatchOutput,
+) -> StandardDispatchOutput:
+    return dispatch_output
+
+
+@register_post_permute("flashinfer_nvfp4", "standard")
+def _post_permute_flashinfer_nvfp4_to_standard(
+    runner_output: torch.Tensor,
+    dispatch_output: StandardDispatchOutput,
+) -> StandardCombineInput:
+    del dispatch_output
+    return StandardCombineInput(hidden_states=runner_output)
+
+
 __all__ = ["StandardDispatchOutput", "StandardCombineInput", "StandardDispatcher"]

@@ -12,6 +12,23 @@ from minisgl.scheduler import SchedulerConfig
 from minisgl.utils import init_logger
 
 
+def _hf_config_uses_modelopt_nvfp4(config) -> bool:
+    def value(obj, name, default=None):
+        return obj.get(name, default) if isinstance(obj, dict) else getattr(obj, name, default)
+
+    for candidate in (config, value(config, "text_config", None)):
+        if candidate is None:
+            continue
+        quant = value(candidate, "quantization_config", None)
+        if quant is None:
+            continue
+        if not isinstance(quant, dict):
+            quant = getattr(quant, "to_dict", lambda: {})()
+        if quant.get("quant_method") == "modelopt" and quant.get("quant_algo") == "NVFP4":
+            return True
+    return False
+
+
 @dataclass(frozen=True)
 class ServerArgs(SchedulerConfig):
     mode: str = "serve"
@@ -47,6 +64,8 @@ class ServerArgs(SchedulerConfig):
     afd_report_dir: str = ""
     afd_device_comm_num_sms: int = 1
     afd_disable_overlap: bool = False
+    afd_async_pending_steps: int = 3
+    afd_force_multi_mb_graph_overlap: bool = False
     afd_num_mb: int = 1
 
     @property
@@ -176,6 +195,33 @@ def _validate_afd_parallel_args(
             "1 disables EP, mlp_tp_size is per-MLP-DP EP, and mlp_world is "
             f"full-world EP. Got ep_size={ep_size} mlp_world={mlp_world}."
         )
+
+
+def _afd_multi_mb_graph_requires_serial_steps(kwargs: dict) -> bool:
+    """DeepEP graph instances are not safe with multiple steps in flight.
+
+    This only serializes the coordinator/worker command lead. The per-step
+    multi-MB AG/EG paper pipeline still overlaps its compute and communication
+    lanes.
+    """
+    graph_requested = bool(kwargs.get("afd_decode_graph_bs")) or int(
+        kwargs.get("cuda_graph_max_bs") or 0
+    ) > 0
+    return (
+        kwargs.get("mode") == "afd-serve"
+        and int(kwargs.get("afd_num_mb") or 1) > 1
+        and bool(kwargs.get("afd_enable_attention_decode_graph"))
+        and bool(kwargs.get("afd_enable_model_decode_graph"))
+        and graph_requested
+    )
+
+
+def _afd_multi_mb_graph_auto_serializes(kwargs: dict) -> bool:
+    return (
+        _afd_multi_mb_graph_requires_serial_steps(kwargs)
+        and not bool(kwargs.get("afd_disable_overlap"))
+        and not bool(kwargs.get("afd_force_multi_mb_graph_overlap"))
+    )
 
 
 def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bool]:
@@ -511,12 +557,21 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
 
     parser.add_argument(
         "--afd-moe-runner-backend",
-        choices=["auto", "triton", "triton_fp8", "triton_kernel", "deep_gemm"],
+        choices=[
+            "auto",
+            "triton",
+            "triton_fp8",
+            "triton_kernel",
+            "deep_gemm",
+            "flashinfer_nvfp4",
+        ],
         default=ServerArgs.afd_moe_runner_backend,
         help=(
             "MoE compute runner backend. 'triton_fp8' uses the FP8-native "
             "Triton fallback; 'deep_gemm' uses minisgl's vendored grouped "
-            "DeepGEMM kernels for DeepEP V2 expanded layout."
+            "DeepGEMM kernels for DeepEP V2 expanded layout; "
+            "'flashinfer_nvfp4' uses native ModelOpt NVFP4 routed experts with "
+            "DeepEP non-expanded token/top-k transport."
         ),
     )
 
@@ -630,6 +685,26 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     )
 
     parser.add_argument(
+        "--afd-async-pending-steps",
+        type=int,
+        default=ServerArgs.afd_async_pending_steps,
+        help=(
+            "Maximum number of outstanding global AFD steps in overlap mode. "
+            "The workers launch this window before retiring the oldest reply."
+        ),
+    )
+
+    parser.add_argument(
+        "--afd-force-multi-mb-graph-overlap",
+        action="store_true",
+        default=ServerArgs.afd_force_multi_mb_graph_overlap,
+        help=(
+            "Diagnostic opt-in: allow cross-step overlap for multi-MB decode "
+            "graphs despite the collective re-entry safety guard."
+        ),
+    )
+
+    parser.add_argument(
         "--afd-num-mb",
         type=int,
         default=ServerArgs.afd_num_mb,
@@ -664,10 +739,12 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
             kwargs["model_path"] = model_path
     del kwargs["model_source"]
 
+    hf_config = None
     if (dtype_str := kwargs["dtype"]) == "auto":
         from minisgl.utils import cached_load_hf_config
 
-        dtype_str = cached_load_hf_config(kwargs["model_path"]).dtype
+        hf_config = cached_load_hf_config(kwargs["model_path"])
+        dtype_str = hf_config.dtype
 
     DTYPE_MAP = {
         "float16": torch.float16,
@@ -688,12 +765,19 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
             parser.error(
                 "AFD serve centralized scheduler currently supports only --cache-type naive"
             )
-        # AFD experts run DeepEP m2n dispatch/combine under a DeepGEMM contract; the
-        # generic auto->triton runner default deadlocks the cross-role NVLink barrier
-        # (Triton experts vs DeepGEMM-contract comm). Default the AFD expert runner to
-        # deep_gemm -- the only backend the AFD EG path supports.
         if kwargs["afd_moe_runner_backend"] == "auto":
-            kwargs["afd_moe_runner_backend"] = "deep_gemm"
+            if hf_config is None:
+                from minisgl.utils import cached_load_hf_config
+
+                hf_config = cached_load_hf_config(kwargs["model_path"])
+            # ModelOpt NVFP4 checkpoints need FlashInfer's native W4A4 MoE
+            # runner and DeepEP's non-expanded token/top-k transport. Existing
+            # BF16/FP8 AFD models retain the expanded DeepGEMM contract.
+            kwargs["afd_moe_runner_backend"] = (
+                "flashinfer_nvfp4"
+                if _hf_config_uses_modelopt_nvfp4(hf_config)
+                else "deep_gemm"
+            )
     if kwargs["cuda_graph_max_bs"] is None and not kwargs["afd_decode_graph_bs"]:
         cap = (
             int(kwargs["afd_max_running_req"])
@@ -702,9 +786,35 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         )
         if cap >= 1:
             kwargs["cuda_graph_max_bs"] = min(cap, 512)
+    if int(kwargs["afd_async_pending_steps"]) < 2:
+        parser.error("--afd-async-pending-steps must be >= 2")
+    if bool(kwargs["afd_force_multi_mb_graph_overlap"]) and bool(
+        kwargs["afd_disable_overlap"]
+    ):
+        parser.error(
+            "--afd-force-multi-mb-graph-overlap conflicts with --afd-disable-overlap"
+        )
+    auto_serialized_graph_steps = _afd_multi_mb_graph_auto_serializes(kwargs)
+    if auto_serialized_graph_steps:
+        kwargs["afd_disable_overlap"] = True
     _validate_afd_parallel_args(parser, kwargs)
 
     result = ServerArgs(**kwargs)
     logger = init_logger(__name__)
+    if auto_serialized_graph_steps:
+        logger.warning(
+            "AFD multi-MB decode graphs serialize cross-step command launch to "
+            "avoid re-entering captured DeepEP collectives; within-step "
+            "microbatch compute/communication overlap remains enabled."
+        )
+    elif (
+        bool(kwargs["afd_force_multi_mb_graph_overlap"])
+        and _afd_multi_mb_graph_requires_serial_steps(kwargs)
+    ):
+        logger.warning(
+            "AFD multi-MB decode graph cross-step overlap is FORCE ENABLED for "
+            "diagnostic profiling; async_pending_steps=%d",
+            int(kwargs["afd_async_pending_steps"]),
+        )
     logger.info(f"Parsed arguments:\n{result}")
     return result, run_shell

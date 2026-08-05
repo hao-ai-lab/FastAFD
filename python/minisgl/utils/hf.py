@@ -1,8 +1,9 @@
 import functools
+import json
 import os
 from typing import Any
 
-from huggingface_hub import snapshot_download
+from huggingface_hub import hf_hub_download, snapshot_download
 from transformers import AutoConfig, PretrainedConfig
 
 from minisgl.hf_support import DisabledTqdm, load_tokenizer, local_files_only, resolve_local_model_dir
@@ -10,11 +11,32 @@ from minisgl.hf_support import DisabledTqdm, load_tokenizer, local_files_only, r
 
 @functools.cache
 def _load_hf_config_cached(resolved_model_path: str, local_files_only: bool) -> Any:
-    return AutoConfig.from_pretrained(
-        resolved_model_path,
-        local_files_only=local_files_only,
-        trust_remote_code=True,
-    )
+    try:
+        return AutoConfig.from_pretrained(
+            resolved_model_path,
+            local_files_only=local_files_only,
+            trust_remote_code=True,
+        )
+    except ValueError:
+        # Transformers 4.x predates Qwen3.5, while vLLM ships a compatible
+        # config implementation. mini-sgl only needs the serialized fields, so
+        # retain them in a generic PretrainedConfig instead of requiring a
+        # process-wide Transformers upgrade.
+        if os.path.isdir(resolved_model_path):
+            config_path = os.path.join(resolved_model_path, "config.json")
+            if not os.path.isfile(config_path):
+                raise
+        else:
+            config_path = hf_hub_download(
+                repo_id=resolved_model_path,
+                filename="config.json",
+                local_files_only=local_files_only,
+            )
+        with open(config_path, encoding="utf-8") as f:
+            config_dict = json.load(f)
+        if config_dict.get("model_type") not in {"qwen3_5", "qwen3_5_moe"}:
+            raise
+        return PretrainedConfig(**config_dict)
 
 
 def _load_hf_config(model_path: str) -> Any:

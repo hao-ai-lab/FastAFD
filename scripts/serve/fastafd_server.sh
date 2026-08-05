@@ -32,6 +32,10 @@ Options:
   --cuda-graph-max-bs N          Default: 8
   --afd-decode-graph-bs CSV      Optional static decode graph buckets
   --afd-num-mb N                 Default: 1
+  --afd-async-pending-steps N    Default: 3
+  --afd-force-multi-mb-graph-overlap
+                                  Diagnostic opt-in for cross-step MB graph overlap
+  --afd-disable-overlap          Disable cross-step overlap
   --afd-device-comm-num-sms N    Default: 1
   --page-size N                  Default: 1
   --max-seq-len-override N       Optional
@@ -64,6 +68,9 @@ CACHE_TYPE="naive"
 CUDA_GRAPH_MAX_BS="8"
 AFD_DECODE_GRAPH_BS=""
 AFD_NUM_MB="1"
+AFD_ASYNC_PENDING_STEPS="3"
+AFD_FORCE_MULTI_MB_GRAPH_OVERLAP=0
+AFD_DISABLE_OVERLAP=0
 AFD_DEVICE_COMM_NUM_SMS="1"
 PAGE_SIZE="1"
 MAX_SEQ_LEN_OVERRIDE=""
@@ -96,6 +103,9 @@ while [[ $# -gt 0 ]]; do
     --cuda-graph-max-bs) CUDA_GRAPH_MAX_BS="$2"; shift 2 ;;
     --afd-decode-graph-bs) AFD_DECODE_GRAPH_BS="$2"; shift 2 ;;
     --afd-num-mb) AFD_NUM_MB="$2"; shift 2 ;;
+    --afd-async-pending-steps) AFD_ASYNC_PENDING_STEPS="$2"; shift 2 ;;
+    --afd-force-multi-mb-graph-overlap) AFD_FORCE_MULTI_MB_GRAPH_OVERLAP=1; shift ;;
+    --afd-disable-overlap) AFD_DISABLE_OVERLAP=1; shift ;;
     --afd-device-comm-num-sms) AFD_DEVICE_COMM_NUM_SMS="$2"; shift 2 ;;
     --page-size) PAGE_SIZE="$2"; shift 2 ;;
     --max-seq-len-override) MAX_SEQ_LEN_OVERRIDE="$2"; shift 2 ;;
@@ -153,6 +163,7 @@ cmd=(
   --cache-type "$CACHE_TYPE"
   --cuda-graph-max-bs "$CUDA_GRAPH_MAX_BS"
   --afd-num-mb "$AFD_NUM_MB"
+  --afd-async-pending-steps "$AFD_ASYNC_PENDING_STEPS"
   --afd-device-comm-num-sms "$AFD_DEVICE_COMM_NUM_SMS"
   --page-size "$PAGE_SIZE"
 )
@@ -172,6 +183,12 @@ fi
 if [[ -n "$AFD_DECODE_GRAPH_BS" ]]; then
   cmd+=(--afd-decode-graph-bs "$AFD_DECODE_GRAPH_BS")
 fi
+if [[ "$AFD_FORCE_MULTI_MB_GRAPH_OVERLAP" -eq 1 ]]; then
+  cmd+=(--afd-force-multi-mb-graph-overlap)
+fi
+if [[ "$AFD_DISABLE_OVERLAP" -eq 1 ]]; then
+  cmd+=(--afd-disable-overlap)
+fi
 if [[ -n "$MAX_SEQ_LEN_OVERRIDE" ]]; then
   cmd+=(--max-seq-len-override "$MAX_SEQ_LEN_OVERRIDE")
 fi
@@ -181,5 +198,23 @@ if [[ -n "$EXTRA_ARGS" ]]; then
 fi
 
 export PYTHONUNBUFFERED=1
+
+if [[ -n "${CONDA_PREFIX:-}" ]]; then
+  CUDA_TARGET_ROOT="${CONDA_PREFIX}/targets/sbsa-linux"
+  if [[ -f "${CUDA_TARGET_ROOT}/include/cuda_bf16.h" ]]; then
+    # General MiniSGL extensions (pynccl, Triton/TVM-FFI AOT) resolve CUDA
+    # from the Conda prefix. The NVFP4 module retargets FlashInfer in-process.
+    export CUDA_HOME="${CONDA_PREFIX}"
+    export CUDA_PATH="${CONDA_PREFIX}"
+    export CUDA_NVCC_EXECUTABLE="${CUDA_NVCC_EXECUTABLE:-${CONDA_PREFIX}/bin/nvcc}"
+    export FLASHINFER_NVCC="${FLASHINFER_NVCC:-${CONDA_PREFIX}/bin/nvcc}"
+    export PATH="${CONDA_PREFIX}/nvvm/bin:${CONDA_PREFIX}/bin:${CUDA_TARGET_ROOT}/bin:${PATH}"
+    if [[ -n "${FLASHINFER_WORKSPACE_BASE:-}" && \
+          "${FLASHINFER_WORKSPACE_BASE##*/}" != "cuda-target-sbsa-linux" ]]; then
+      export FLASHINFER_WORKSPACE_BASE="${FLASHINFER_WORKSPACE_BASE%/}/cuda-target-sbsa-linux"
+    fi
+  fi
+fi
+
 cd "$CALIB_DIR"
 exec "${cmd[@]}"

@@ -396,6 +396,7 @@ class _ElasticRuntimeHandle:
 class DeepEPMoeElasticHandle:
     handle: Any
     recv_shape: tuple[int, ...]
+    use_expanded_layout: bool = True
 
 
 class DeepEPMoeElasticBuffer:
@@ -547,6 +548,7 @@ class DeepEPMoeElasticBuffer:
         expert_alignment: int = 1,
         num_max_dispatch_tokens_per_rank: int | None = None,
         do_cpu_sync: bool = False,
+        use_expanded_layout: bool = True,
     ):
         if topk_ids.dtype != self.topk_idx_dtype:
             topk_ids = topk_ids.to(self.topk_idx_dtype)
@@ -612,7 +614,7 @@ class DeepEPMoeElasticBuffer:
             False,
             True,
             do_cpu_sync,
-            True,
+            bool(use_expanded_layout),
             True,
         )
         if hidden_states_scale is not None and recv_sf is None:
@@ -632,6 +634,7 @@ class DeepEPMoeElasticBuffer:
         wrapped = DeepEPMoeElasticHandle(
             handle=runtime_handle,
             recv_shape=tuple(int(x) for x in recv_x.shape),
+            use_expanded_layout=bool(use_expanded_layout),
         )
         return (
             recv_x,
@@ -650,7 +653,7 @@ class DeepEPMoeElasticBuffer:
         runtime_handle = handle.handle
         if tuple(expert_output.shape) != tuple(handle.recv_shape):
             raise RuntimeError(
-                "DeepEP expanded combine expects expert output to match "
+                "DeepEP combine expects expert output to match "
                 f"recv_shape={handle.recv_shape}, got={tuple(expert_output.shape)}"
             )
         send = expert_output if expert_output.is_contiguous() else expert_output.contiguous()
@@ -674,7 +677,7 @@ class DeepEPMoeElasticBuffer:
             None,
             False,
             False,
-            True,
+            bool(handle.use_expanded_layout),
         )
         return combined
 

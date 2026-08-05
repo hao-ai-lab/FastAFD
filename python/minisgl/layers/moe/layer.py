@@ -72,6 +72,7 @@ class MoELayer(BaseOP):
 
         if ep_size == 1:
             self.local_num_experts = num_experts
+            self.local_expert_offset = 0
             self._expert_map_dev: torch.Tensor | None = None
             intermediate_size_per_partition = div_even(intermediate_size, tp_info.size)
         else:
@@ -79,6 +80,7 @@ class MoELayer(BaseOP):
             self.local_num_experts, expert_map_cpu = _build_expert_map(
                 num_experts, ep_info.rank, ep_size
             )
+            self.local_expert_offset = int(ep_info.rank) * self.local_num_experts
             device = (
                 torch.device("cuda", torch.cuda.current_device())
                 if torch.cuda.is_available()
@@ -90,8 +92,48 @@ class MoELayer(BaseOP):
             intermediate_size_per_partition = intermediate_size
 
         self._is_fp8 = quant is not None and quant.method in ("fp8", "fp8_channel")
+        self._is_nvfp4 = quant is not None and quant.method == "modelopt_nvfp4"
         self._fp8_scale_format = None
-        if self._is_fp8:
+        if self._is_nvfp4:
+            if hidden_size % 16 or intermediate_size_per_partition % 16:
+                raise RuntimeError(
+                    "ModelOpt NVFP4 requires hidden and local intermediate sizes "
+                    f"divisible by 16, got {hidden_size} and "
+                    f"{intermediate_size_per_partition}"
+                )
+            self.gate_up_proj = torch.empty(
+                self.local_num_experts,
+                2 * intermediate_size_per_partition,
+                hidden_size // 2,
+                dtype=torch.uint8,
+            )
+            self.gate_up_proj_scale = torch.empty(
+                self.local_num_experts,
+                2 * intermediate_size_per_partition,
+                hidden_size // 16,
+                dtype=torch.float8_e4m3fn,
+            )
+            self.gate_up_proj_weight_scale_2 = torch.empty(
+                self.local_num_experts, 2, dtype=torch.float32
+            )
+            self.gate_up_proj_input_scale = torch.empty(2, dtype=torch.float32)
+            self.down_proj = torch.empty(
+                self.local_num_experts,
+                hidden_size,
+                intermediate_size_per_partition // 2,
+                dtype=torch.uint8,
+            )
+            self.down_proj_scale = torch.empty(
+                self.local_num_experts,
+                hidden_size,
+                intermediate_size_per_partition // 16,
+                dtype=torch.float8_e4m3fn,
+            )
+            self.down_proj_weight_scale_2 = torch.empty(
+                self.local_num_experts, dtype=torch.float32
+            )
+            self.down_proj_input_scale = torch.empty((), dtype=torch.float32)
+        elif self._is_fp8:
             assert quant is not None
             if quant.method == "fp8_channel":
                 block_out, block_in = (1, 1)
@@ -168,6 +210,14 @@ class MoELayer(BaseOP):
             if a2a_backend is not None
             else getattr(server_args, "afd_moe_a2a_backend", "none")
         )
+        if self._is_nvfp4:
+            if runner_backend == "auto":
+                runner_backend = "flashinfer_nvfp4"
+            elif runner_backend != "flashinfer_nvfp4":
+                raise RuntimeError(
+                    "ModelOpt NVFP4 routed experts require "
+                    "afd_moe_runner_backend=flashinfer_nvfp4"
+                )
         if a2a_backend == "deepep" and runner_backend == "auto":
             runner_backend = "deep_gemm"
         runner_config = MoeRunnerConfig(
@@ -192,8 +242,13 @@ class MoELayer(BaseOP):
             moe_runner_config=runner_config,
             dp_size=self.moe_dp_size,
         )
-        if isinstance(self.dispatcher, DeepEPDispatcher) and runner_backend != "deep_gemm":
-            raise RuntimeError("DeepEP elastic MoE requires afd_moe_runner_backend=deep_gemm")
+        if isinstance(self.dispatcher, DeepEPDispatcher) and runner_backend not in {
+            "deep_gemm",
+            "flashinfer_nvfp4",
+        }:
+            raise RuntimeError(
+                "DeepEP elastic MoE requires deep_gemm or flashinfer_nvfp4"
+            )
         runner_config.runner_backend = runner_backend
         self.runner = create_moe_runner(
             runner_backend=runner_backend,

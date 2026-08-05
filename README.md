@@ -129,6 +129,8 @@ Validated package versions are `torch 2.10.0+cu130`, `triton 3.6.0`,
 
 - Quickstart and correctness: `Qwen/Qwen3-30B-A3B-Instruct-2507`
 - Published scaling presets: Qwen3-235B-A22B-FP8 and MiniMax-M2.5-FP8
+- Hybrid linear attention: Qwen3.5-122B-A10B-FP8 and Qwen3.5-397B-A17B-FP8,
+  which interleave gated DeltaNet with full attention at 3:1
 
 ### Quickstart
 
@@ -164,6 +166,21 @@ option list):
   --afd-max-running-requests 64 --sample-concurrency 64 \
   --max-new-tokens 64
 ```
+
+Qwen3.5 ships two presets over the same validator. Each pins a checkpoint
+revision, so a result is reproducible:
+
+```bash
+./scripts/validate/qwen35_122b_a10b_fp8_fastafd_alignment.sh
+./scripts/validate/qwen35_397b_a17b_fp8_fastafd_alignment.sh
+```
+
+Both need a Ray cluster with 8 GPUs (attention TP 4 + MLP TP/EP 4) and a second
+conda environment holding the vLLM reference, named by `VLLM_ENV_NAME` (default
+`vllm-cuda130`). They start from the eager, graph-off, single-microbatch
+baseline; once that passes, set `AFD_SERVER_EXTRA_ARGS=""` to enable both AFD
+decode graphs. Run `./scripts/validate/qwen35_fastafd_alignment.sh --help` for
+the full control list.
 
 ### Large-Scale AFD Experiments
 
@@ -207,6 +224,21 @@ Available presets:
 | Qwen3-235B-A22B-FP8 | 16K | 48 requests / attention GPU | `scripts/experiments/afd/qwen3_235b/run_afd_qwen3_235b_a22b_fp8_16k_b48_dynamicnode_mb2_nsys_alignment.sh` |
 | MiniMax-M2.5-FP8 | 8K | 72 requests / attention GPU | `scripts/experiments/afd/minimax_m25/run_afd_minimax_m25_fp8_8k_b72_dynamicnode_mb2_nsys_alignment.sh` |
 | MiniMax-M2.5-FP8 | 16K | 36 requests / attention GPU | `scripts/experiments/afd/minimax_m25/run_afd_minimax_m25_fp8_16k_b36_dynamicnode_mb2_nsys_alignment.sh` |
+| Qwen3.5-122B-A10B-FP8 | 8K | 256 requests / attention GPU | `scripts/experiments/afd/qwen35/run_afd_qwen35_122b_a10b_fp8_8k_b256_2node_mb2_nsys_alignment.sh` |
+| Qwen3.5-397B-A17B-FP8 | 8K | 320 requests / attention GPU | `scripts/experiments/afd/qwen35/run_afd_qwen35_397b_a17b_fp8_8k_b320_2node_mb2_nsys_alignment.sh` |
+
+The Qwen3.5 presets fix their topology rather than sizing it from the cluster:
+four attention workers (DP 4, no tensor parallelism) and four expert workers
+(DP 4, EP 4) — two 4-GPU nodes on the reference setup. They ignore
+`AFD_TOTAL_NODES` and refuse to start on any other worker count, because a
+retained decode window is only free of tensor-parallel all-reduce traffic at
+this layout. `AFD_NUM_MB=2` is the micro-batch ping-pong overlap and is the
+default; `AFD_NUM_MB=1` gives the serialized baseline to compare against.
+
+```bash
+MODEL_PATH=/path/to/Qwen3.5-397B-A17B-FP8 RUN_VLLM_ALIGNMENT=0 NSYS=0 \
+bash scripts/experiments/afd/qwen35/run_afd_qwen35_397b_a17b_fp8_8k_b320_2node_mb2_nsys_alignment.sh
+```
 
 **vLLM cross-check (`RUN_VLLM_ALIGNMENT=1`).** Scores through an expert-parallel
 vLLM baseline (`--all2all-backend deepep_low_latency --moe-backend deep_gemm`),

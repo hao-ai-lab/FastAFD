@@ -9,7 +9,7 @@ import torch
 from minisgl.attention import create_attention_backend
 from minisgl.core import Batch, Context, Req, set_global_ctx
 from minisgl.distributed import destroy_distributed, enable_pynccl_distributed, set_tp_info
-from minisgl.kvcache import create_kvcache_pool
+from minisgl.kvcache import create_hybrid_gdn_state_pool, create_kvcache_pool
 from minisgl.layers import set_rope_device
 from minisgl.models import create_model, load_weight
 from minisgl.moe import create_moe_backend
@@ -238,6 +238,19 @@ class Engine:
             self.model.load_state_dict(self._load_weight_state_dict(config))
 
             # ======================= KV cache initialization ========================
+            self.ctx.gdn_state_pool = create_hybrid_gdn_state_pool(
+                config.model_config,
+                max_slots=config.max_running_req + 1,
+                dtype=self.dtype,
+                device=self.device,
+            )
+            if self.ctx.gdn_state_pool is not None:
+                logger.info_rank0(
+                    "Allocated hybrid GDN state: layers=%d slots=%d bytes_per_slot=%d",
+                    len(self.ctx.gdn_state_pool.layer_ids),
+                    self.ctx.gdn_state_pool.max_slots,
+                    self.ctx.gdn_state_pool.bytes_per_slot,
+                )
             self.num_pages = self._determine_num_pages(init_free_memory, config)
             num_tokens = self.num_pages * config.page_size
             self.ctx.kv_cache = self.kv_cache = create_kvcache_pool(
@@ -313,6 +326,10 @@ class Engine:
                 getattr(config.model_config, "architectures", [""])[0]
                 == "Glm4MoeForCausalLM"
             )
+            is_qwen35 = (
+                getattr(config.model_config, "architectures", [""])[0]
+                == "Qwen3_5MoeForConditionalGeneration"
+            )
 
             def _minimax_fp32_key(key: str) -> bool:
                 return is_minimax_m2 and (
@@ -326,13 +343,20 @@ class Engine:
                     or key.endswith(".mlp.gate.e_score_correction_bias")
                 )
 
+            def _qwen35_fp32_key(key: str) -> bool:
+                return is_qwen35 and (
+                    key.endswith(".linear_attn.A_log")
+                    or key.endswith("_input_scale")
+                    or key.endswith("_weight_scale_2")
+                )
+
             return {
                 k: (
                     v
-                    if v.dtype == torch.float8_e4m3fn
+                    if v.dtype in (torch.uint8, torch.float8_e4m3fn)
                     or (v.dtype == torch.float32 and k.endswith("_scale"))
                     else v.to(torch.float32)
-                    if _minimax_fp32_key(k) or _glm4_fp32_key(k)
+                    if _minimax_fp32_key(k) or _glm4_fp32_key(k) or _qwen35_fp32_key(k)
                     else v.to(self.dtype)
                 )
                 for k, v in load_weight(config.model_path, self.device)
@@ -346,7 +370,7 @@ class Engine:
             * div_even(config.model_config.num_kv_heads, config.tp_info.size, allow_replicate=True)
             * config.page_size
             * self.dtype.itemsize
-            * config.model_config.num_layers
+            * config.model_config.num_full_attention_layers
         )
         num_pages = config.num_page_override
         if num_pages is None:

@@ -17,7 +17,7 @@ from minisgl.distributed import destroy_distributed
 from minisgl.engine.config import EngineConfig
 from minisgl.engine.engine import _adjust_config, _init_tp_communication
 from minisgl.engine.graph import get_free_memory, mem_GB
-from minisgl.kvcache import create_kvcache_pool
+from minisgl.kvcache import create_hybrid_gdn_state_pool, create_kvcache_pool
 from minisgl.utils import div_even, init_logger, nvtx_label, nvtx_range
 
 from .afd_attention_runtime import AfdAttentionRuntime
@@ -75,6 +75,19 @@ class AfdAttentionState:
         self.tp_cpu_group = _init_tp_communication(config, self.dtype)
         free_memory = self._sync_get_memory()[1]
 
+        self.ctx.gdn_state_pool = create_hybrid_gdn_state_pool(
+            config.model_config,
+            max_slots=config.max_running_req + 1,
+            dtype=self.dtype,
+            device=self.device,
+        )
+        if self.ctx.gdn_state_pool is not None:
+            logger.info_rank0(
+                "AFD allocated hybrid GDN state: layers=%d slots=%d bytes_per_slot=%d",
+                len(self.ctx.gdn_state_pool.layer_ids),
+                self.ctx.gdn_state_pool.max_slots,
+                self.ctx.gdn_state_pool.bytes_per_slot,
+            )
         self.num_pages = self._determine_num_pages(free_memory, config)
         self.max_seq_len = min(config.max_seq_len, self.num_pages * config.page_size)
         aligned_max_seq_len = ((self.max_seq_len + 31) // 32) * 32
@@ -127,15 +140,17 @@ class AfdAttentionState:
         return min_free_memory, max_free_memory
 
     def _determine_num_pages(self, old_free_memory: int, config: EngineConfig) -> int:
+        new_free_memory = self._sync_get_memory()[1]
         cache_per_page = (
             2
             * config.model_config.head_dim
             * div_even(config.model_config.num_kv_heads, config.tp_info.size, allow_replicate=True)
             * config.page_size
             * self.dtype.itemsize
-            * config.model_config.num_layers
+            * config.model_config.num_full_attention_layers
         )
-        available_memory = int(config.memory_ratio * old_free_memory)
+        state_memory = old_free_memory - new_free_memory
+        available_memory = int(config.memory_ratio * old_free_memory) - state_memory
         memory_cap = available_memory // cache_per_page
         requested = config.num_page_override
         if requested is None:
@@ -311,6 +326,9 @@ class AfdAgDecodeGraphRunner:
         self._input_ids = torch.zeros((self.max_bs,), dtype=torch.int32, device=self.device)
         self._positions = torch.zeros((self.max_bs,), dtype=torch.int32, device=self.device)
         self._out_loc = torch.zeros((self.max_bs,), dtype=torch.int32, device=self.device)
+        self._state_indices = torch.zeros(
+            (self.max_bs,), dtype=torch.int64, device=self.device
+        )
         self._final_out = torch.empty(
             (self.max_bs, self.hidden_size), dtype=torch.bfloat16, device=self.device
         )
@@ -338,6 +356,7 @@ class AfdAgDecodeGraphRunner:
         batch.input_ids = self._input_ids[:bs]
         batch.positions = self._positions[:bs]
         batch.out_loc = self._out_loc[:bs]
+        batch.state_indices = self._state_indices[:bs]
         return batch
 
     def warmup(self, bs: int) -> None:
@@ -465,6 +484,7 @@ class AfdAgDecodeGraphRunner:
             sub.input_ids = self._input_ids[s:e]
             sub.positions = self._positions[s:e]
             sub.out_loc = self._out_loc[s:e]
+            sub.state_indices = self._state_indices[s:e]
             backend.prepare_for_capture(sub)
             subs.append(sub)
         whole.attn_metadata = subs[0].attn_metadata  # embed ignores it
@@ -552,6 +572,7 @@ class AfdAgDecodeGraphRunner:
             self._input_ids[:bs].copy_(batch.input_ids[:bs])
             self._positions[:bs].copy_(batch.positions[:bs])
             self._out_loc[:bs].copy_(batch.out_loc[:bs])
+            self._state_indices[:bs].copy_(batch.state_indices[:bs])
             for mb in range(num_mb):
                 cap_sub = buf.sub_batches[mb]
                 cap_sub.reqs = real_subs[mb].reqs
@@ -576,6 +597,7 @@ class AfdAgDecodeGraphRunner:
             self._input_ids[:bs].copy_(batch.input_ids[:bs])
             self._positions[:bs].copy_(batch.positions[:bs])
             self._out_loc[:bs].copy_(batch.out_loc[:bs])
+            self._state_indices[:bs].copy_(batch.state_indices[:bs])
             cap = buf.capture_batch
             cap.reqs = batch.reqs
             cap.padded_reqs = batch.padded_reqs
@@ -878,14 +900,15 @@ class AfdAttentionWorker(BaseAfdWorker):
                 )
 
     def centralized_overlap_loop(self) -> None:
-        # Fixed two-step-ahead AG: launch two future commands before retiring the
-        # oldest reply handle. This lets cudaGraphLaunch for N+2 enqueue before
-        # the CPU waits on N's D2H copy event. AfdFlushStepCmd is the explicit
-        # pipeline-drain marker at generation end.
+        # Launch a finite future-command window before retiring the oldest reply
+        # handle. With the default pending window 3, cudaGraphLaunch for N+2
+        # enqueues before the CPU waits on N's D2H copy event.
         pending_afd_ag: deque[_AfdAgInFlight] = deque()
 
         def retire_afd_ag(force: bool = False) -> None:
-            while pending_afd_ag and (force or len(pending_afd_ag) > 2):
+            while pending_afd_ag and (
+                force or len(pending_afd_ag) > self.async_retire_depth
+            ):
                 self._process_last_afd_ag(pending_afd_ag.popleft())
 
         while True:
@@ -1038,7 +1061,8 @@ class AfdAttentionWorker(BaseAfdWorker):
             log_line(
                 self.log_path,
                 f"[{self.role} rank={self.tp_rank}] afd_ag_decode_graph:replay "
-                f"step_id={int(plan.step_id)} bs={int(graph_bs)} num_mb={int(plan.num_mb)}",
+                f"step_id={int(plan.step_id)} real={int(plan.real_size)} "
+                f"bs={int(graph_bs)} num_mb={int(plan.num_mb)}",
                 flush=True,
             )
             return self._afd_ag_graph.replay(batch, graph_bs)
