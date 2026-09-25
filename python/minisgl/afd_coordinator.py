@@ -670,6 +670,7 @@ class AfdCoordinator:
         self,
         msg: BaseBackendMsg,
         forward_remains: list[_AfdForwardRemain],
+        pending_free: dict[int, tuple[int, ...]],
     ) -> bool:
         with nvtx_range(
             nvtx_label(
@@ -678,7 +679,7 @@ class AfdCoordinator:
             )
         ):
             if isinstance(msg, BatchBackendMsg):
-                return self._process_batch_msg(msg.data, forward_remains)
+                return self._process_batch_msg(msg.data, forward_remains, pending_free)
             if isinstance(msg, ExitMsg):
                 self._shutdown_requested = True
                 self._broadcast_cmd_to_workers(AfdStopCmd())
@@ -687,7 +688,7 @@ class AfdCoordinator:
                 self._process_user_msgs([msg])
                 return True
             if isinstance(msg, AbortBackendMsg):
-                self._process_abort_msg(msg, forward_remains)
+                self._process_abort_msg(msg, forward_remains, pending_free)
                 return True
             raise NotImplementedError(f"Unsupported tokenizer msg: {type(msg)}")
 
@@ -695,6 +696,7 @@ class AfdCoordinator:
         self,
         msgs: list[BaseBackendMsg],
         forward_remains: list[_AfdForwardRemain],
+        pending_free: dict[int, tuple[int, ...]],
     ) -> bool:
         pending_users: list[UserMsg] = []
 
@@ -707,14 +709,14 @@ class AfdCoordinator:
         for msg in msgs:
             if isinstance(msg, BatchBackendMsg):
                 flush_users()
-                if not self._process_batch_msg(msg.data, forward_remains):
+                if not self._process_batch_msg(msg.data, forward_remains, pending_free):
                     return False
                 continue
             if isinstance(msg, UserMsg):
                 pending_users.append(msg)
                 continue
             flush_users()
-            if not self._process_one_msg(msg, forward_remains):
+            if not self._process_one_msg(msg, forward_remains, pending_free):
                 return False
         flush_users()
         return True
@@ -740,17 +742,21 @@ class AfdCoordinator:
         self,
         msg: AbortBackendMsg,
         forward_remains: list[_AfdForwardRemain],
+        pending_free: dict[int, tuple[int, ...]],
     ) -> None:
         uid = int(msg.uid)
         dp_rank = self._uid_to_attn_dp.pop(uid, None)
+        # Reuse the step FIFO so AG state is freed after older in-flight commands.
         if dp_rank is not None:
             dp = int(dp_rank)
             freed = tuple(self._central_schedulers[dp].abort_req(uid))
             forward_remains[dp].forget_tables(freed)
+            pending_free[dp] += freed
         else:
             for fallback_dp_rank, scheduler in enumerate(self._central_schedulers):
                 freed = tuple(scheduler.abort_req(uid))
                 forward_remains[fallback_dp_rank].forget_tables(freed)
+                pending_free[fallback_dp_rank] += freed
 
     def send_result(self, replies: list[DetokenizeMsg]) -> None:
         if not replies:
@@ -1164,7 +1170,7 @@ class AfdCoordinator:
         while True:
             blocking = not self._has_local_scheduler_work()
             for msg in self.receive_msg(blocking=blocking):
-                if not self._process_one_msg(msg, forward_remains):
+                if not self._process_one_msg(msg, forward_remains, pending_free):
                     return
 
             global_phase = self._afd_next_global_phase(scheds)
@@ -1249,7 +1255,7 @@ class AfdCoordinator:
         while True:
             blocking = not pending and not self._has_local_scheduler_work()
             for msg in self.receive_msg(blocking=blocking):
-                if not self._process_one_msg(msg, forward_remains):
+                if not self._process_one_msg(msg, forward_remains, pending_free):
                     if pending:
                         flush_pending_workers("shutdown")
                     while pending:
