@@ -932,6 +932,9 @@ class AfdCoordinator:
                 real_results.append((dp, model_plan, batch))
                 results_by_dp[dp] = (model_plan, batch)
         if not real_results:
+            if global_phase == "prefill" and any(s.decode_manager.runnable for s in scheds):
+                # Decode must be able to release KV when every prefill admission fails.
+                return self._afd_prepare_step_launch(step_id, scheds, "decode")
             if profile:
                 log_line(
                     self.log_path,
