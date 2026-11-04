@@ -632,6 +632,7 @@ topk_gating_kernel_v2(
     int num_rows,
     int topk,
     bool renormalize) {
+  ::host::minisgl_pdl_entry();
   static_assert(VPT == (VPT & -VPT), "VPT must be power of 2");
   static_assert(NUM_EXPERTS == (NUM_EXPERTS & -NUM_EXPERTS),
                 "NUM_EXPERTS must be power of 2");
@@ -961,8 +962,8 @@ void topk_gating_v2_launcher_helper(
   const int num_warps = (num_tokens + ROWS_PER_WARP - 1) / ROWS_PER_WARP;
   const int num_blocks = (num_warps + WARPS_PER_TB - 1) / WARPS_PER_TB;
   dim3 block_dim(kWarpSize, WARPS_PER_TB);
-  topk_gating_kernel_v2<InputT, VPT, EXPERTS, WARPS_PER_TB, kBytesPerLdg, SF, WITH_BIAS>
-      <<<num_blocks, block_dim, 0, stream>>>(
+  ::host::LaunchKernel(dim3(num_blocks), block_dim, stream).with_attr(::host::minisgl_pdl_enabled())(
+      topk_gating_kernel_v2<InputT, VPT, EXPERTS, WARPS_PER_TB, kBytesPerLdg, SF, WITH_BIAS>,
           gating_output, bias, topk_weights, topk_indices, staged_weights,
           num_tokens, topk,
           renormalize);
@@ -1157,10 +1158,13 @@ void topk_gating_softmax_group_local_kernel_launcher(
     case 256:
       LAUNCH_GROUP_LOCAL_SOFTMAX(256, WARPS_PER_TB);
       break;
+    case 512:
+      LAUNCH_GROUP_LOCAL_SOFTMAX(512, WARPS_PER_TB);
+      break;
     default:
       host::RuntimeCheck(
           false,
-          "group-local topk supports only power-of-two num_experts <= 256; got ",
+          "group-local topk supports only power-of-two num_experts <= 512; got ",
           num_experts);
   }
 }

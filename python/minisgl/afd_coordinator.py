@@ -38,6 +38,11 @@ from .afd_protocol import (
     AfdEGStepPlan,
     AfdRunAGStepCmd,
     AfdRunEGStepCmd,
+    AfdCadInitCmd,
+    AfdCadReadyReply,
+    AfdCadStepReply,
+    AfdRunCadStepCmd,
+    cad_microbatch_rows,
     build_afd_ag_plan,
 )
 from minisgl.scheduler.scheduler import (
@@ -46,6 +51,7 @@ from minisgl.scheduler.scheduler import (
 from minisgl.utils import (
     ZmqPullQueue,
     ZmqPushQueue,
+    div_ceil,
     init_logger,
     init_nvtx_cpu_trace,
     load_tokenizer,
@@ -67,6 +73,7 @@ from .afd_profiler import (
     stop_nsys_runtime_capture,
 )
 from .afd_scheduler import CentralizedAfdDpScheduler
+from .spec.config import AfdSpecConfig, afd_spec_config, check_spec_supported
 from .afd_worker_launcher import startup_afd_workers
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -124,13 +131,27 @@ class AfdCoordinator:
     attention and model nodes.
     """
 
+    # MINISGL_AFD_STEP_TIMES=1 logs every step's time (see _log_step_time)
+    _log_step_times = False
+    # MINISGL_AFD_PREFIX_CACHE (see _init_runtime_state)
+    _prefix_cache = "naive"
+    # CAD decode (MINISGL_AFD_MODE=cad, minisgl.cad): the CadConfig, read once (_cad_config)
+    _cad_cfg = None
+    # Speculative decoding config; __init__ reads MINISGL_AFD_SPEC.
+    spec = AfdSpecConfig()
+
     def __init__(self, server_args: ServerArgs):
         self.server_args = server_args
+        self._log_step_times = bool(_env_int("MINISGL_AFD_STEP_TIMES", 0))
         self.max_batched_tokens = int(server_args.afd_max_batched_tokens)
         if self.max_batched_tokens < 1:
             raise RuntimeError("--afd-max-batched-tokens must be >= 1")
         self.max_seq_len = int(server_args.max_seq_len)
+        self.spec = afd_spec_config()
         self.device_comm_num_sms = max(1, int(server_args.afd_device_comm_num_sms))
+        self.async_pending_steps = max(
+            2, int(server_args.afd_async_pending_steps)
+        )
         if str(server_args.cache_type) != "naive":
             raise RuntimeError(
                 "AFD serve uses the centralized scheduler and currently supports only cache_type='naive'"
@@ -238,15 +259,40 @@ class AfdCoordinator:
         self._worker_inbox_addr: str | None = None
         self._next_attn_dp_rr = 0
         self._uid_to_attn_dp: dict[int, int] = {}
+        # MINISGL_AFD_PREFIX_CACHE=radix: one radix prefix cache per attention DP group on
+        # the coordinator's page ledger (page ids reach the workers as explicit grants, so
+        # their KV pools and decode graphs are unchanged). A group's prefix is only
+        # reusable in that group, so admission prefers the group that holds the longest cached prefix of a prompt.
+        self._prefix_cache = os.environ.get("MINISGL_AFD_PREFIX_CACHE", "").strip() or "naive"
+        if self._prefix_cache not in ("naive", "radix"):
+            raise ValueError(f"unknown MINISGL_AFD_PREFIX_CACHE {self._prefix_cache!r}")
+        if self._prefix_cache != "naive":
+            # the radix key compare is a JIT C++ extension: build / load it now, not on
+            # the first prefix match in the middle of serving (~1.5 s on a fresh tree)
+            import torch
+            from minisgl.kernel import fast_compare_key
+
+            fast_compare_key(torch.zeros(1, dtype=torch.int32), torch.zeros(1, dtype=torch.int32))
+        check_spec_supported(self.spec, prefix_cache=self._prefix_cache)
         self._central_schedulers: list[CentralizedAfdDpScheduler] = []
         self._afd_reply_seen: dict[int, int] = {}
         self._afd_reply_tokens_by_dp: dict[int, dict[int, list[int]]] = {}
         self._shutdown_requested = False
+        self._worker_stop_lock = threading.Lock()
+        self._worker_stop_sent = False
         self._nsys_runtime_started = False
+        self._nsys_runtime_finished = False
         self._nsys_start_step = max(0, _env_int("MINISGL_RAY_NSYS_START_STEP", 0))
         self._nsys_stop_step = max(0, _env_int("MINISGL_RAY_NSYS_STOP_STEP", 0))
+        self._shutdown_timeout_s = max(
+            5.0,
+            float(_env_int("MINISGL_AFD_SHUTDOWN_TIMEOUT_S", 30)),
+        )
         self._thread: threading.Thread | None = None
         self._failure: str | None = None
+        # True while prefill admits nothing and the loop decodes instead; logged
+        # once per such episode (see _afd_prepare_next_step).
+        self._afd_admission_blocked = False
 
     def _refresh_runtime_sizing(self) -> None:
         sizing = build_runtime_sizing(
@@ -259,23 +305,17 @@ class AfdCoordinator:
             afd_max_running_req=int(self.server_args.afd_max_running_req),
             max_batched_tokens=self.max_batched_tokens,
             afd_num_mb=int(self.server_args.afd_num_mb),
+            attn_dp_size=int(self._layout.attn_dp_size),
         )
         self.decode_graph_bs = sizing.decode_graph_bs
         if sizing.requested_graph_bs and not self.decode_graph_bs:
-            if sizing.num_mb > 1:
-                logger.warning(
-                    "AFD split decode graph has no usable per-MB bucket for afd_num_mb=%d; "
-                    "falling back to eager-only split-step execution.",
-                    sizing.num_mb,
-                )
-            else:
-                logger.warning(
-                    "AFD decode graph is currently disabled for backend=%s page_size=%d cache_type=%s; "
-                    "falling back to eager-only execution.",
-                    self.attention_backend,
-                    self.page_size,
-                    self.server_args.cache_type,
-                )
+            logger.warning(
+                "AFD decode graph is currently disabled for backend=%s page_size=%d cache_type=%s; "
+                "falling back to eager-only execution.",
+                self.attention_backend,
+                self.page_size,
+                self.server_args.cache_type,
+            )
         self.max_graph_bs = sizing.max_graph_bs
         self.max_running_req = sizing.max_running_req
         # `max_running_req` is the global server capacity.  Each attention-DP
@@ -287,7 +327,10 @@ class AfdCoordinator:
             (int(self.max_running_req) + int(self._layout.attn_dp_size) - 1)
             // int(self._layout.attn_dp_size),
         )
-        self.num_page_override = sizing.num_page_override
+        requested_pages = getattr(self.server_args, "num_page_override", None)
+        self.num_page_override = (
+            requested_pages if requested_pages is not None else sizing.num_page_override
+        )
         self.max_comm_tokens = sizing.max_comm_tokens
         # A single MLP-DP lane may merge multiple attention-DP lanes.  The
         # shared GIN slot layout must cover the largest merged MLP microbatch
@@ -295,6 +338,34 @@ class AfdCoordinator:
         # max_batched_tokens budget.
         self.max_comm_tokens *= self._layout.attn_fanin_per_mlp_dp
         self.afd_num_mb = sizing.num_mb
+        lane_graph_bs = div_ceil(self.attn_max_running_req, self.afd_num_mb)
+        if sizing.added_graph_bs is not None:
+            logger.warning(
+                "AFD decode graph sizes %s stop below %d per microbatch, the decode batch of "
+                "an attention-DP lane holding its %d requests at afd_num_mb=%d; capturing %d "
+                "too, because a decode step in which any lane lacks a graph runs every lane eager.",
+                list(sizing.requested_graph_bs),
+                lane_graph_bs,
+                self.attn_max_running_req,
+                self.afd_num_mb,
+                sizing.added_graph_bs,
+            )
+        # vLLM leaves a batch above its largest graph to eager or piecewise
+        # execution; here that one lane would take every lane of the step eager,
+        # so a lane at capacity must have a graph (vLLM bounds batches by
+        # max_num_seqs; this bounds them by the captured sizes).
+        graphs_on = self.enable_attention_decode_graph and self.enable_model_decode_graph
+        if graphs_on and self.decode_graph_bs and lane_graph_bs > self.max_graph_bs:
+            raise RuntimeError(
+                f"AFD decode graphs {list(self.decode_graph_bs)} stop at {self.max_graph_bs} "
+                f"requests per microbatch, but an attention-DP lane holds up to "
+                f"{self.attn_max_running_req} requests (max_running_req={self.max_running_req} "
+                f"over attn_dp={self._layout.attn_dp_size}), {lane_graph_bs} per microbatch at "
+                f"afd_num_mb={self.afd_num_mb}. A decode step in which any lane lacks a graph "
+                f"runs every lane eager. Capture a size >= {lane_graph_bs} "
+                "(--afd-decode-graph-bs / --cuda-graph-max-bs) or lower "
+                "--afd-max-running-requests."
+            )
 
     def _validate_dp_layout(self) -> AfdTopology:
         try:
@@ -474,6 +545,10 @@ class AfdCoordinator:
             f"attention_backend={self.attention_backend} "
             f"max_batched_tokens={self.max_batched_tokens} "
             f"decode_graph_bs={list(self.decode_graph_bs)} "
+            f"disable_overlap={bool(self.server_args.afd_disable_overlap)} "
+            f"async_pending_steps={self.async_pending_steps} "
+            f"spec={self.spec.method or 'off'} spec_block={self.spec.block} "
+            f"spec_sim_accept={self.spec.sim_accept} "
             f"centralized_scheduler=True",
             flush=True,
         )
@@ -552,19 +627,28 @@ class AfdCoordinator:
             return "AfdCoordinator loop exited unexpectedly"
         return None
 
+    def _stop_workers_once(self) -> None:
+        # ExitMsg is handled on the event-loop thread; shutdown is a Ray actor
+        # method. A second PUSH after workers close their PULL sockets can wait
+        # forever for a peer. Serialize the two callers and send only once.
+        with self._worker_stop_lock:
+            if not self._worker_stop_sent:
+                self._broadcast_cmd_to_workers(AfdStopCmd())
+                self._worker_stop_sent = True
+
     def shutdown(self) -> None:
         self._shutdown_requested = True
         if self._cmd_to_workers:
             self._shutdown_call(
                 "broadcast_stop",
-                lambda: self._broadcast_cmd_to_workers(AfdStopCmd()),
+                self._stop_workers_once,
             )
         if self._thread is not None:
-            self._thread.join(timeout=5.0)
+            self._thread.join(timeout=self._shutdown_timeout_s)
         if self._worker_hot_loop_refs:
             self._shutdown_call(
                 "wait_worker_hot_loops",
-                lambda: ray.get(self._worker_hot_loop_refs, timeout=5.0),
+                self._wait_for_worker_hot_loops,
             )
             self._worker_hot_loop_refs = []
         if self._nsys_runtime_started:
@@ -598,6 +682,12 @@ class AfdCoordinator:
             log_line(self.log_path, f"[afd-coordinator] cpu_trace flushed path={trace_path}", flush=True)
         flush_log_lines(self.log_path)
 
+    def _wait_for_worker_hot_loops(self) -> None:
+        ray.get(
+            self._worker_hot_loop_refs,
+            timeout=self._shutdown_timeout_s,
+        )
+
     def _init_centralized_schedulers(self) -> None:
         if not self.attn_workers:
             raise RuntimeError("Cannot initialize centralized scheduler without attention workers")
@@ -622,13 +712,16 @@ class AfdCoordinator:
                 afd_num_mb=self.afd_num_mb,
                 mlp_fanout=mlp_fanout,
                 eos_token_id=eos_token_id,
+                prefix_cache=self._prefix_cache,
             )
             for dp_rank in range(self._layout.attn_dp_size)
         ]
+        max_concurrency = self._central_schedulers[0].max_concurrency(max_seq_len)
         log_line(
             self.log_path,
             f"[afd-coordinator] centralized_scheduler ready "
             f"num_pages={num_pages} max_seq_len={max_seq_len} "
+            f"max_concurrency@{max_seq_len}={max_concurrency} "
             f"cache_type={self.server_args.cache_type} "
             f"global_max_running_req={self.max_running_req} "
             f"attn_local_max_running_req={self.attn_max_running_req}",
@@ -647,6 +740,8 @@ class AfdCoordinator:
         if gc_was_enabled:
             gc.disable()
         try:
+            if self._cad_config().enabled:
+                self._cad_init()
             self._afd_run_loop()
             return
         finally:
@@ -681,7 +776,7 @@ class AfdCoordinator:
                 return self._process_batch_msg(msg.data, forward_remains)
             if isinstance(msg, ExitMsg):
                 self._shutdown_requested = True
-                self._broadcast_cmd_to_workers(AfdStopCmd())
+                self._stop_workers_once()
                 return False
             if isinstance(msg, UserMsg):
                 self._process_user_msgs([msg])
@@ -719,17 +814,36 @@ class AfdCoordinator:
         flush_users()
         return True
 
+    def _admit_dp(self, msg: UserMsg) -> int:
+        """The attention DP group a new prompt joins: round-robin, or with a prefix cache
+        (a prefix is only reusable in its own group) the group holding the longest cached
+        prefix of it."""
+        n_dp = int(self._layout.attn_dp_size)
+        hits = (
+            [self._central_schedulers[d].prefix_match_len(msg.input_ids) for d in range(n_dp)]
+            if self._prefix_cache != "naive"
+            else [0] * n_dp
+        )
+        best = max(hits)
+        if best > 0:
+            return hits.index(best)
+        dp_rank = self._next_attn_dp_rr % n_dp
+        self._next_attn_dp_rr += 1
+        return dp_rank
+
     def _process_user_msgs(self, msgs: list[UserMsg]) -> None:
         by_dp: dict[int, list[UserMsg]] = {}
         for msg in msgs:
             if not _prepare_user_msg(
                 msg=msg,
-                max_seq_len=self.max_seq_len,
+                # A verify step and its draft lookahead write up to 2 * block
+                # positions past the last committed token, plus a block per step
+                # still in flight when the request finishes (overlap loop).
+                max_seq_len=self.max_seq_len - self._spec_seq_reserve(),
                 warn=logger.warning,
             ):
                 continue
-            dp_rank = self._next_attn_dp_rr % self._layout.attn_dp_size
-            self._next_attn_dp_rr += 1
+            dp_rank = self._admit_dp(msg)
             self._uid_to_attn_dp[int(msg.uid)] = int(dp_rank)
             by_dp.setdefault(int(dp_rank), []).append(msg)
 
@@ -848,6 +962,14 @@ class AfdCoordinator:
         return max(1, int(model_plan.graph_token_count), int(model_plan.padded_size))
 
     def _afd_use_decode_graph(self, model_plan: AfdModelPlan, bucket: int) -> bool:
+        if getattr(model_plan, "spec_verify", False):
+            # A verify step replays the AG verify graph of its per-microbatch
+            # request slots and the EG decode graph of slots x block tokens.
+            if not (self.enable_attention_decode_graph and self.enable_model_decode_graph):
+                return False
+            num_mb = max(1, len(tuple(model_plan.microbatch_offsets)) - 1)
+            per_mb_tokens, rem = divmod(int(bucket), num_mb * self.spec.block)
+            return rem == 0 and any(int(bs) == per_mb_tokens for bs in self.decode_graph_bs)
         if str(model_plan.phase) != "decode":
             return False
         if not (self.enable_attention_decode_graph and self.enable_model_decode_graph):
@@ -884,6 +1006,35 @@ class AfdCoordinator:
             tuple(int(x) for x in model_plan.microbatch_offsets),
         )
 
+    def _spec_seq_reserve(self) -> int:
+        if not self.spec.enabled:
+            return 0
+        in_flight = 0 if self.server_args.afd_disable_overlap else self.async_pending_steps
+        return (2 + in_flight) * self.spec.block
+
+    def _afd_filter_valid_spec_rows(
+        self,
+        batch: Batch,
+        gens: tuple[int, ...],
+        packed: list[int],
+        forward_remain: _AfdForwardRemain,
+    ) -> list[int]:
+        """Drop verify reply rows of requests freed while the step was in flight."""
+        width = self.spec.block + 1
+        if forward_remain.empty():
+            return list(packed)
+        valid_reqs: list[Req] = []
+        rows: list[int] = []
+        for i, (req, generation) in enumerate(zip(batch.reqs, gens)):
+            if forward_remain.generation(int(req.table_idx)) == int(generation):
+                valid_reqs.append(req)
+                rows.extend(packed[i * width : (i + 1) * width])
+            else:
+                req.afd_spec_inflight = max(0, getattr(req, "afd_spec_inflight", 1) - 1)
+        if len(valid_reqs) != len(batch.reqs):
+            batch.reqs = valid_reqs
+        return rows
+
     @staticmethod
     def _afd_filter_valid_completion_tokens(
         batch: Batch,
@@ -919,12 +1070,20 @@ class AfdCoordinator:
         dummy_ns = 0
         real_results: list[tuple[int, AfdModelPlan, Batch]] = []
         results_by_dp: dict[int, tuple[AfdModelPlan, Batch]] = {}
+        # Speculative verify steps pad every lane to one per-microbatch slot count,
+        # so the lanes share a dispatch bucket and the captured verify graphs.
+        verify_slot = None
+        if self.spec.enabled and global_phase == "decode":
+            busiest = max(len(sched.decode_manager.running_reqs) for sched in scheds)
+            verify_slot = scheds[0].verify_slot(busiest)
         with nvtx_range(
             nvtx_label("AFD_Coordinator_ScheduleDps", step=step_id, phase=global_phase)
         ):
             for dp, sched in enumerate(scheds):
                 sched_start_ns = time.perf_counter_ns()
-                result = sched.schedule_step(step_id, phase=global_phase)
+                result = sched.schedule_step(
+                    step_id, phase=global_phase, verify_slot=verify_slot
+                )
                 schedule_ns += time.perf_counter_ns() - sched_start_ns
                 if result is None:
                     continue
@@ -949,7 +1108,7 @@ class AfdCoordinator:
             bucket_ns += time.perf_counter_ns() - bucket_start_ns
             dummy_padded_size = (
                 int(bucket)
-                if global_phase == "decode"
+                if global_phase == "decode" and not self.spec.enabled
                 else max(1, int(self.server_args.afd_num_mb))
             )
             dp_batches: list[_AfdDpLaunchBatch] = []
@@ -958,11 +1117,25 @@ class AfdCoordinator:
                 is_dummy = result is None
                 if result is None:
                     dummy_start_ns = time.perf_counter_ns()
-                    result = sched.dummy_decode_step(
-                        step_id,
-                        padded_size=dummy_padded_size,
-                    )
+                    if verify_slot is not None:
+                        result = sched.dummy_verify_step(step_id, slot=verify_slot)
+                    else:
+                        result = sched.dummy_decode_step(
+                            step_id,
+                            padded_size=dummy_padded_size,
+                        )
                     dummy_ns += time.perf_counter_ns() - dummy_start_ns
+                elif (
+                    not getattr(result[0], "spec_verify", False)
+                    and int(result[0].padded_size) < int(bucket)
+                    and (self._afd_use_decode_graph(result[0], bucket) or self._cad_decode(global_phase))
+                ):
+                    # A lane replaying a smaller decode graph would dispatch with a
+                    # different DeepEP bucket than its peers; pad it to the shared one.
+                    result = (
+                        sched.repad_decode_step(step_id, result[1], padded_size=int(bucket)),
+                        result[1],
+                    )
                 dp_batches.append(
                     _AfdDpLaunchBatch(
                         dp_rank=dp,
@@ -990,6 +1163,147 @@ class AfdCoordinator:
                 f"total_ms={total_ns / 1_000_000.0:.3f}",
             )
         return bucket, dp_batches, str(global_phase), next(iter(num_mbs))
+
+    # ===== CAD decode (minisgl.cad, MINISGL_AFD_MODE=cad) =====
+    # Prefill steps stay AFD steps. A decode step goes as one AfdRunCadStepCmd per GPU: attention rank a its own plan,
+    # model GPU j the plans of its r attention GPUs (minisgl.cad.layout.peers_of) and one CadRow per real request; every
+    # lane padded to the step's shared bucket (B rows per mb); no EG command. Replies: one AfdCadStepReply per GPU
+    # (A + M), the tokens from the model GPUs (per peer, in model_rows order), the abort word from every GPU.
+
+    def _cad_config(self):
+        if self._cad_cfg is None:
+            from minisgl.cad.config import CadConfig
+
+            self._cad_cfg = CadConfig.from_env()
+        return self._cad_cfg
+
+    def _cad_decode(self, phase) -> bool:
+        return str(phase) == "decode" and self._cad_config().enabled
+
+    def _cad_drain_needed(self, scheds, pending) -> bool:
+        """True when the next global step would be a CAD decode step while a prefill step is still in flight: its sampled
+        first tokens are not on the host yet (they reach req.input_ids when the step completes), and the CAD step's model
+        GPU takes each request's first decode token from the host (_cad_step_cmds / cad.tokens.host_token)."""
+        if not pending or not self._cad_decode(self._afd_next_global_phase(scheds)):
+            return False
+        return any(getattr(batch, "phase", None) == "prefill" for _, items in pending for _, batch, _ in items)
+
+    def _cad_check_mode(self) -> None:
+        problems = []
+        if self.spec.enabled:
+            problems.append("speculative decoding (MINISGL_AFD_SPEC)")
+        if int(self.attn_tp_size) != 1:
+            problems.append(f"attention TP {self.attn_tp_size} (CAD v1: attention TP1)")
+        if int(self._layout.mlp_tp_size) != 1:
+            problems.append(f"MLP TP {self._layout.mlp_tp_size} (CAD v1: model GPUs TP1)")
+        if not self.decode_graph_bs:
+            problems.append("no decode buckets (decode_graph_bs): CAD steps run at one of them")
+        if problems:
+            raise RuntimeError("MINISGL_AFD_MODE=cad does not support: " + "; ".join(problems))
+
+    def _cad_init(self) -> None:
+        """AfdCadInitCmd to every worker, then every worker's AfdCadReadyReply (collective init on the workers)."""
+        self._cad_check_mode()
+        buckets = tuple(sorted({int(b) for b in self.decode_graph_bs}))
+        use_graph = bool(self.enable_attention_decode_graph and self.enable_model_decode_graph)
+        cmd = AfdCadInitCmd(num_mb=int(self.afd_num_mb), t_max=max(buckets), buckets=buckets,
+                            table_rows=int(self.attn_max_running_req) + 1, use_graph=use_graph)
+        self._cad_expected: dict[int, int] = {}
+        self._cad_errors: dict[int, list] = {}
+        self._cad_seen_tables: set = set()
+        expected = len(self._cmd_to_workers)
+        # MINISGL_AFD_CAD_INIT_TIMEOUT_S (CadConfig, default 900 s), not the AFD startup timeout: a CAD init that never
+        # completes (e.g. a mismatched symm_mem rendezvous) fails here, naming the ranks without a ready reply
+        timeout_s = float(self._cad_config().init_timeout_s)
+        log_line(self.log_path, f"[afd-cad] init: {cmd} -> {expected} workers (timeout {timeout_s:.0f} s)", flush=True)
+        self._broadcast_cmd_to_workers(cmd)
+        ready: dict[int, tuple] = {}
+        deadline = time.monotonic() + timeout_s
+        while len(ready) < expected:
+            replies = self._recv_worker_inbox()
+            for reply in replies:
+                if not isinstance(reply, AfdCadReadyReply):
+                    raise RuntimeError(f"CAD init: unexpected {type(reply).__name__} from worker {reply.worker_rank}")
+                ready[int(reply.worker_rank)] = tuple(int(b) for b in reply.captured)
+            if time.monotonic() > deadline:
+                raise RuntimeError(f"CAD init: {len(ready)} of {expected} workers ready after {timeout_s:.0f} s "
+                                   f"(missing {sorted(set(range(expected)) - set(ready))})")
+            if not replies:
+                time.sleep(0.05)
+        short = {r: c for r, c in ready.items() if use_graph and c != buckets}
+        if short:
+            raise RuntimeError(f"CAD init: workers without a graph of every bucket {buckets}: {short}")
+        log_line(self.log_path, f"[afd-cad] ready: {expected} workers, buckets {buckets}, graphs {use_graph}", flush=True)
+
+    def _cad_step_cmds(self, step_id: int, cad_items: list, *, bucket: int, num_mb: int,
+                       use_graph: bool) -> list[tuple[tuple[int, ...], AfdRunCadStepCmd]]:
+        """(worker ranks, command) of every GPU for one CAD decode step (pure host work; _send_cad_step sends them)."""
+        from minisgl.cad.layout import peers_of
+        from minisgl.cad.tokens import CadRow, host_token
+
+        A, M = int(self._layout.total_attn_workers), int(self._layout.mlp_world_size)
+        if int(bucket) % int(num_mb):
+            raise RuntimeError(f"CAD step {step_id}: bucket {bucket} is not a multiple of {num_mb} microbatches")
+        B = int(bucket) // int(num_mb)
+        by_dp = {int(dp): (plan, item) for dp, plan, item in cad_items}
+        if sorted(by_dp) != list(range(A)):
+            raise RuntimeError(f"CAD step {step_id}: plans for lanes {sorted(by_dp)}, the CAD world has {A} attention GPUs")
+        out = []
+        for dp in range(A):
+            plan, _ = by_dp[dp]
+            offs = tuple(int(x) for x in plan.microbatch_offsets)
+            spans = [offs[k + 1] - offs[k] for k in range(len(offs) - 1)]
+            if len(spans) != int(num_mb) or any(s != B for s in spans):
+                raise RuntimeError(f"CAD step {step_id}: lane {dp} microbatch rows {spans}, the step's bucket is {B} per mb")
+            out.append(((dp,), AfdRunCadStepCmd(step_id=int(step_id), plans=[plan], bucket=B, use_graph=bool(use_graph))))
+        seen = self._cad_seen_tables
+        for j in range(M):
+            peers = peers_of(j, A, M)
+            rows = []
+            for p, dp in enumerate(peers):
+                plan, item = by_dp[dp]
+                if item.is_dummy:
+                    continue
+                batch = item.batch
+                for req, (mb, i) in zip(batch.reqs, cad_microbatch_rows(batch.padded_reqs, batch.reqs,
+                                                                         plan.microbatch_offsets), strict=True):
+                    sp = getattr(req, "sampling_params", None)
+                    if sp is not None and not sp.is_greedy:
+                        raise RuntimeError(f"CAD step {step_id}: request uid {getattr(req, 'uid', '?')} is not greedy (the "
+                                           "model GPU's graph samples argmax only)")
+                    pos = int(req.device_len) - 1
+                    tok = host_token(req.input_ids, pos + 1)
+                    key = (dp, int(req.table_idx), getattr(req, "uid", id(req)))
+                    if tok < 0 and key not in seen:
+                        raise RuntimeError(f"CAD step {step_id}: lane {dp} table {req.table_idx} has no host token and no "
+                                           "earlier CAD step (its first decode token must come from the AFD prefill)")
+                    seen.add(key)
+                    rows.append(CadRow(peer=p, mb=int(mb), i=int(i), table_index=int(req.table_idx), position=pos,
+                                       host_token=int(tok)))
+            out.append(((A + j,), AfdRunCadStepCmd(step_id=int(step_id), plans=[by_dp[dp][0] for dp in peers], bucket=B,
+                                                   use_graph=bool(use_graph), model_rows=tuple(rows))))
+        return out
+
+    def _send_cad_step(self, step_id: int, cad_items: list, *, bucket: int, num_mb: int, use_graph: bool) -> None:
+        cmds = self._cad_step_cmds(step_id, cad_items, bucket=bucket, num_mb=num_mb, use_graph=use_graph)
+        for ranks, cmd in cmds:
+            cmd.sent_ns = time.time_ns()
+            self._send_cmd_to_workers(ranks, cmd)
+        self._cad_expected[int(step_id)] = len(cmds)
+
+    def _cad_route_reply(self, reply: AfdCadStepReply) -> None:
+        """A CAD step reply: the abort word, and on a model GPU its peers' tokens (peer -> lane)."""
+        from minisgl.cad.layout import peers_of
+
+        sid = int(reply.step_id)
+        if int(reply.err):
+            self._cad_errors.setdefault(sid, []).append((int(reply.worker_rank), int(reply.err)))
+        if reply.tokens:
+            A, M = int(self._layout.total_attn_workers), int(self._layout.mlp_world_size)
+            peers = peers_of(int(reply.worker_rank) - A, A, M)
+            store = self._afd_reply_tokens_by_dp.setdefault(sid, {})
+            for p, toks in reply.tokens.items():
+                store[peers[int(p)]] = [int(t) for t in toks]
 
     def _afd_launch_step(
         self,
@@ -1026,6 +1340,8 @@ class AfdCoordinator:
         )
         use_graph_ns = time.perf_counter_ns() - use_graph_start_ns
         items: list[tuple[int, Batch, tuple[int, ...]]] = []
+        cad = self._cad_decode(phase)   # CAD decode: one AfdRunCadStepCmd per GPU after the loop, no EG command
+        cad_items: list = []
         with nvtx_range(nvtx_label("AFD_Coordinator_LaunchAG", step=step_id, phase=phase)):
             ag_loop_start_ns = time.perf_counter_ns()
             for item in dp_batches:
@@ -1054,13 +1370,17 @@ class AfdCoordinator:
                     dispatch_bucket=bucket,
                     free_table_indices=pending_free[dp],
                     use_decode_graph=use_decode_graph,
+                    grants=scheds[dp].page_grants(batch.reqs),
                 )
                 ag_build_ns += time.perf_counter_ns() - ag_build_start_ns
                 rank_start_ns = time.perf_counter_ns()
                 ranks = tuple(range(dp * attn_tp, (dp + 1) * attn_tp))
                 rank_ns += time.perf_counter_ns() - rank_start_ns
                 ag_send_start_ns = time.perf_counter_ns()
-                self._send_cmd_to_workers(ranks, AfdRunAGStepCmd(plan=ag_plan))
+                if cad:
+                    cad_items.append((dp, ag_plan, item))
+                else:
+                    self._send_cmd_to_workers(ranks, AfdRunAGStepCmd(plan=ag_plan))
                 ag_send_ns += time.perf_counter_ns() - ag_send_start_ns
                 pending_free[dp] = ()
                 if not item.is_dummy:
@@ -1069,10 +1389,15 @@ class AfdCoordinator:
                 items.append((dp, batch, gens))
                 append_ns += time.perf_counter_ns() - append_start_ns
             ag_loop_ns = time.perf_counter_ns() - ag_loop_start_ns
+            if cad:
+                self._send_cad_step(step_id, cad_items, bucket=int(bucket), num_mb=int(num_mb), use_graph=bool(use_decode_graph))
 
         with nvtx_range(nvtx_label("AFD_Coordinator_LaunchEG", step=step_id, phase=phase)):
             eg_loop_start_ns = time.perf_counter_ns()
             eg_build_start_ns = time.perf_counter_ns()
+            # A speculative verify step is an extend on the AG side only; its
+            # tokens reach the experts like decode tokens, so the EG keeps the
+            # decode path (no per-layer CPU sync on the dispatch counts).
             eg_plan = AfdEGStepPlan(
                 step_id=step_id,
                 phase=phase,  # type: ignore[arg-type]
@@ -1082,10 +1407,13 @@ class AfdCoordinator:
             )
             eg_build_ns = time.perf_counter_ns() - eg_build_start_ns
             eg_send_start_ns = time.perf_counter_ns()
-            self._send_cmd_to_workers(
-                self._afd_expert_worker_ranks,
-                AfdRunEGStepCmd(plan=eg_plan),
-            )
+            if cad:
+                pass  # the model GPUs run the step's MoE inside the CAD program
+            else:
+                self._send_cmd_to_workers(
+                    self._afd_expert_worker_ranks,
+                    AfdRunEGStepCmd(plan=eg_plan),
+                )
             eg_send_ns = time.perf_counter_ns() - eg_send_start_ns
             eg_loop_ns = time.perf_counter_ns() - eg_loop_start_ns
         if state_updates:
@@ -1094,6 +1422,12 @@ class AfdCoordinator:
             ):
                 state_start_ns = time.perf_counter_ns()
                 for dp, batch in state_updates:
+                    if getattr(batch, "afd_spec_verify", False):
+                        # Advanced by the accepted length at completion; until then
+                        # the step counts as in flight for page allocation.
+                        for req in batch.reqs:
+                            req.afd_spec_inflight = getattr(req, "afd_spec_inflight", 0) + 1
+                        continue
                     for req in batch.reqs:
                         req.complete_one()
                     scheds[dp].decode_manager.filter_reqs(batch.reqs)
@@ -1167,12 +1501,15 @@ class AfdCoordinator:
                 if not self._process_one_msg(msg, forward_remains):
                     return
 
-            global_phase = self._afd_next_global_phase(scheds)
-            prepared = self._afd_prepare_step_launch(step_id, scheds, global_phase)
+            prepared, stuck = self._afd_prepare_next_step(step_id, scheds)
             if prepared is None:
+                if stuck:
+                    # Every step completes before the next, so nothing is in flight.
+                    self._afd_raise_admission_stall(scheds)
                 continue
             bucket, dp_batches, phase, num_mb = prepared
             maybe_start_nsys_runtime_capture_for_step(self, step_id)
+            step_start_ns = time.perf_counter_ns()
             items = self._afd_launch_step(
                 step_id=step_id,
                 attn_tp=attn_tp,
@@ -1191,8 +1528,40 @@ class AfdCoordinator:
                 attn_tp,
             ).items():
                 pending_free[dp] = tuple(pending_free[dp]) + tuple(freed)
+            if self._log_step_times:
+                self._log_step_time(step_id, phase, bucket, num_mb, dp_batches,
+                                    time.perf_counter_ns() - step_start_ns)
             maybe_stop_nsys_runtime_capture_after_step(self, step_id)
             step_id += 1
+
+    def _log_step_time(self, step_id, phase, bucket, num_mb, dp_batches, elapsed_ns) -> None:
+        """MINISGL_AFD_STEP_TIMES=1: one line per global step, with each group's real
+        requests, KV context tokens and KV pages in use. The synchronous loop times a
+        step from launch to its last reply; the overlap loop, with steps in flight,
+        times the interval between step completions."""
+        n_dp = len(self._central_schedulers)
+        real = [0] * n_dp
+        ctx_tokens = [0] * n_dp
+        for item in dp_batches:
+            if item.is_dummy:
+                continue
+            dp = int(item.dp_rank)
+            real[dp] = int(item.batch.size)
+            ctx_tokens[dp] = sum(int(r.device_len) for r in item.batch.reqs)
+        pages = [
+            int(s.cache_manager.num_pages) - int(s.cache_manager.available_size) // int(self.page_size)
+            for s in self._central_schedulers
+        ]
+        rank_pages = pages
+        log_line(
+            self.log_path,
+            f"[afd-step-time] step={int(step_id)} phase={phase} bucket={int(bucket)} num_mb={int(num_mb)} "
+            f"ms={elapsed_ns / 1e6:.3f} real={real} ctx={ctx_tokens} group_pages={pages} "
+            f"rank_kv_pages={rank_pages}"
+            + (f" prefix_hit_tokens={[int(s.prefix_hit_tokens) for s in self._central_schedulers]}"
+               if self._prefix_cache != "naive" else ""),
+            flush=True,
+        )
 
     def _afd_overlap_loop(self) -> None:
         """AFD overlap loop with a fixed finite command lead.
@@ -1206,11 +1575,12 @@ class AfdCoordinator:
         scheds = self._central_schedulers
         attn_tp = int(self.attn_tp_size)
         forward_remains = [_AfdForwardRemain() for _ in range(n_dp)]
-        max_pending = 3
+        max_pending = self.async_pending_steps
         log_line(
             self.log_path,
             f"[afd-overlap] mode=dp_lockstep_fixed_lead n_dp={n_dp} "
             f"attn_tp={attn_tp} max_pending={max_pending}",
+            flush=True,
         )
         self._afd_reply_seen = {}
         self._afd_reply_tokens_by_dp = {}
@@ -1231,8 +1601,14 @@ class AfdCoordinator:
             self._broadcast_cmd_to_workers(AfdFlushStepCmd())
             workers_flushed = True
 
+        step_meta: dict = {}
+        last_done_ns = [0]
+
         def complete_pending(pending_item) -> None:
             gsid = pending_item[0]
+            if self._log_step_times:
+                # with steps in flight, the step time is the interval between completions
+                meta = step_meta.pop(gsid, None)
             for dp, freed in self._afd_complete_global(
                 pending_item,
                 scheds,
@@ -1244,10 +1620,19 @@ class AfdCoordinator:
                 # command FIFO means this free reaches the AG worker only after
                 # all older in-flight commands that might still reference it.
                 pending_free[dp] = tuple(pending_free[dp]) + tuple(freed)
+            if self._log_step_times:
+                now = time.perf_counter_ns()
+                if meta is not None and last_done_ns[0]:
+                    self._log_step_time(gsid, meta[0], meta[1], meta[2], meta[3], now - last_done_ns[0])
+                last_done_ns[0] = now
             maybe_stop_nsys_runtime_capture_after_step(self, gsid)
 
         while True:
             blocking = not pending and not self._has_local_scheduler_work()
+            if blocking:
+                # idle until the next request: the step after it is timed from its
+                # launch-time predecessor's completion otherwise, idle time included
+                last_done_ns[0] = 0
             for msg in self.receive_msg(blocking=blocking):
                 if not self._process_one_msg(msg, forward_remains):
                     if pending:
@@ -1257,12 +1642,16 @@ class AfdCoordinator:
                     return
 
             scheduled_none = False
+            stuck = False
             while len(pending) < max_pending:
-                prepared = self._afd_prepare_step_launch(
-                    step_id,
-                    scheds,
-                    self._afd_next_global_phase(scheds),
-                )
+                if self._cad_drain_needed(scheds, pending):
+                    # a CAD decode step needs every request's first decode token on the host (_cad_step_cmds: host_token);
+                    # an in-flight prefill step's sampled tokens reach req.input_ids only when it completes (otherwise:
+                    # "lane 0 table 0 has no host token"), so every in-flight step completes first
+                    flush_pending_workers("cad_decode_after_prefill")
+                    while pending:
+                        complete_pending(pending.popleft())
+                prepared, stuck = self._afd_prepare_next_step(step_id, scheds)
                 if prepared is None:
                     scheduled_none = True
                     break
@@ -1280,6 +1669,8 @@ class AfdCoordinator:
                     num_mb=num_mb,
                 )
                 pending.append((step_id, items))
+                if self._log_step_times:
+                    step_meta[step_id] = (phase, bucket, num_mb, dp_batches)
                 step_id += 1
                 workers_flushed = False
 
@@ -1289,15 +1680,102 @@ class AfdCoordinator:
                     complete_pending(pending.popleft())
                 continue
 
+            if scheduled_none and stuck:
+                # Nothing is in flight (the branch above drained it), so no
+                # completion can free a page before the next attempt.
+                self._afd_raise_admission_stall(scheds)
+
             if pending and len(pending) >= max_pending:
                 complete_pending(pending.popleft())
+
+    def _afd_prepare_next_step(
+        self,
+        step_id: int,
+        scheds: list[CentralizedAfdDpScheduler],
+    ) -> tuple[tuple[int, list[_AfdDpLaunchBatch], str, int] | None, bool]:
+        """Prepare the next global step, decoding when prefill admits nothing.
+
+        Prefill is chosen while any lane holds a waiting request and a free
+        table, but admission only takes a request whose prompt + max_tokens
+        fits the free pages after reserving the running requests' remaining
+        tokens. When no lane admits anything, only decoding the running
+        requests can free pages, so this step decodes instead and the waiting
+        requests form a later wave -- as vLLM's scheduler keeps decoding while
+        a waiting request cannot be allocated. Retrying prefill instead spun
+        forever with every GPU idle.
+
+        Returns (prepared, stuck). stuck means prefill admitted nothing and no
+        lane has a request to decode, so only a step still in flight can free
+        a page.
+        """
+        global_phase = self._afd_next_global_phase(scheds)
+        prepared = self._afd_prepare_step_launch(step_id, scheds, global_phase)
+        if prepared is not None:
+            if global_phase == "prefill":
+                self._afd_admission_blocked = False
+            return prepared, False
+        if global_phase != "prefill":
+            return None, False
+        if not any(sched.decode_manager.runnable for sched in scheds):
+            return None, True
+        if not self._afd_admission_blocked:
+            # Flushed so a benchmark sees the extra wave while the run is live.
+            self._afd_admission_blocked = True
+            log_line(
+                self.log_path,
+                f"[afd-coordinator] admission_blocked step_id={int(step_id)}: prefill "
+                "admits no waiting request; decoding the running requests until they "
+                "free pages. " + self._afd_describe_waiting(scheds),
+                flush=True,
+            )
+        return self._afd_prepare_step_launch(step_id, scheds, "decode"), False
+
+    @staticmethod
+    def _afd_describe_waiting(scheds: list[CentralizedAfdDpScheduler]) -> str:
+        return "; ".join(
+            f"dp{dp}: {detail}"
+            for dp, sched in enumerate(scheds)
+            if (detail := sched.describe_waiting_admission()) is not None
+        )
+
+    def _afd_raise_admission_stall(self, scheds: list[CentralizedAfdDpScheduler]) -> None:
+        """Fail loudly where the loop would otherwise retry one state forever.
+
+        Called when prefill admits nothing, no lane has a request to decode and
+        no step is in flight. Then no request holds pages, so a head waiting
+        request that still does not fit needs more KV than its lane's whole
+        pool and can never be admitted.
+        """
+        never_fit = [dp for dp, sched in enumerate(scheds) if sched.waiting_head_exceeds_pool()]
+        if never_fit:
+            message = (
+                "AFD capacity shortfall: a waiting request can never be admitted. On lanes "
+                f"{never_fit} its prompt + max_tokens exceed the lane's whole KV page pool, "
+                "and no running request is left to free pages. Shorten the request, or "
+                "enlarge the KV pool (memory_ratio). "
+            )
+        else:
+            message = (
+                "AFD scheduler cannot make progress: nothing is running or in flight and "
+                "every waiting request fits its lane's pool, yet none is admitted, so the "
+                "page ledger holds pages that no request owns. "
+            )
+        message += self._afd_describe_waiting(scheds)
+        log_line(self.log_path, f"[afd-coordinator] {message}", flush=True)
+        raise RuntimeError(message)
 
     @staticmethod
     def _afd_next_global_phase(scheds: list[CentralizedAfdDpScheduler]) -> str:
         # Prefill stays globally prioritized so AG/EG collectives never mix
         # prefill and decode shapes in the same step.
         if any(
-            s.prefill_manager.runnable and s.table_manager.available_size > 0
+            s.prefill_manager.runnable
+            and (
+                s.table_manager.available_size > 0
+                # A resumed chunk already owns its slot; only new admission
+                # requires a free table entry.
+                or s.prefill_manager.pending_list[0].chunked_req is not None
+            )
             for s in scheds
         ):
             return "prefill"
@@ -1309,17 +1787,33 @@ class AfdCoordinator:
         """Collect all AG (active lanes x attn_tp) + EG replies for the global step;
         map each AG reply's tokens to its DP lane (lane = worker_rank // attn_tp)."""
         expected = len(active_dps) * attn_tp + len(self._afd_expert_worker_ranks)
+        cad_expected = getattr(self, "_cad_expected", None)
+        if cad_expected and step_id in cad_expected:   # a CAD decode step: one reply per GPU
+            expected = cad_expected.pop(step_id)
         seen = self._afd_reply_seen
         store = self._afd_reply_tokens_by_dp
         while seen.get(step_id, 0) < expected:
             for reply in self._recv_worker_inbox():
-                sid = int(reply.step_id)
-                seen[sid] = seen.get(sid, 0) + 1
-                if isinstance(reply, AfdAGStepReply) and reply.next_tokens:
-                    lane = int(reply.worker_rank) // attn_tp
-                    store.setdefault(sid, {})[lane] = list(reply.next_tokens)
+                self._afd_route_reply(reply)
         seen.pop(step_id, None)
+        cad_errors = getattr(self, "_cad_errors", None)
+        if cad_errors and step_id in cad_errors:
+            raise RuntimeError(f"CAD step {step_id} aborted: a flag wait timed out on (worker, abort word) "
+                               f"{cad_errors.pop(step_id)}; its tokens are not valid")
         return store.pop(step_id, {})
+
+    def _afd_route_reply(self, reply: AfdReply) -> None:
+        if reply.step_id is None:
+            return
+        sid = int(reply.step_id)
+        seen = self._afd_reply_seen
+        seen[sid] = seen.get(sid, 0) + 1
+        if isinstance(reply, AfdCadStepReply):
+            self._cad_route_reply(reply)
+            return
+        if isinstance(reply, AfdAGStepReply) and reply.next_tokens:
+            lane = int(reply.worker_rank) // int(self.attn_tp_size)
+            self._afd_reply_tokens_by_dp.setdefault(sid, {})[lane] = list(reply.next_tokens)
 
     def _afd_complete_global(self, pending_item, scheds, forward_remains, attn_tp):
         step_id, items = pending_item
@@ -1353,12 +1847,15 @@ class AfdCoordinator:
             next_tokens = toks_by_dp.get(dp, [])
             fr = forward_remains[dp]
             filter_start_ns = dp_start_ns
-            valid_tokens = self._afd_filter_valid_completion_tokens(
-                batch,
-                gens,
-                next_tokens,
-                fr,
-            )
+            if getattr(batch, "afd_spec_verify", False):
+                valid_tokens = self._afd_filter_valid_spec_rows(batch, gens, next_tokens, fr)
+            else:
+                valid_tokens = self._afd_filter_valid_completion_tokens(
+                    batch,
+                    gens,
+                    next_tokens,
+                    fr,
+                )
             filter_done_ns = time.perf_counter_ns()
             complete_start_ns = filter_done_ns
             with nvtx_range(
@@ -1456,7 +1953,8 @@ class AfdCoordinator:
             log_line(
                 self.log_path,
                 f"[afd-coordinator] control_complete_global "
-                f"step_id={int(step_id)} active_dps={len(items)} attn_tp={int(attn_tp)} "
+                f"step_id={int(step_id)} wall_s={time.time():.6f} "
+                f"active_dps={len(items)} attn_tp={int(attn_tp)} "
                 f"collect_ms={(collect_done_ns - collect_start_ns) / 1_000_000.0:.3f} "
                 f"filter_sum_ms={filter_ms_sum:.3f} "
                 f"complete_results_sum_ms={complete_ms_sum:.3f} "

@@ -121,11 +121,12 @@ class RopeAttn(BaseOP):
         )
 
     @nvtx_annotate("MHA")
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, skip_allreduce: bool = False) -> torch.Tensor:
+        # skip_allreduce returns this TP rank's o_proj partial sum (the caller reduces it).
         qkv = self.qkv_proj.forward(x)
         del x
         o = self.attn.forward(qkv)
-        return self.o_proj.forward(o)
+        return self.o_proj.forward(o, skip_allreduce=skip_allreduce)
 
 
 __all__ = ["GatedMLP", "RopeAttn", "MoEMLP"]

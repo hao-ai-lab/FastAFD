@@ -9,6 +9,8 @@ from minisgl.core import Batch, Req
 @dataclass
 class DecodeManager:
     page_size: int
+    # Tokens a running request may hold past max_device_len (speculative lookahead).
+    extra_reserve: int = 0
     # Keep decode requests keyed by uid so every TP rank can rebuild the same batch order.
     running_reqs: Dict[int, Req] = field(default_factory=dict)
     _ordered_uids: list[int] | None = field(default=None, init=False)
@@ -44,7 +46,8 @@ class DecodeManager:
 
     @property
     def inflight_tokens(self) -> int:
-        tokens_reserved = (self.page_size - 1) * len(self.running_reqs)  # 1 page reserved
+        # 1 page reserved, plus any speculative lookahead past max_device_len
+        tokens_reserved = (self.page_size - 1 + self.extra_reserve) * len(self.running_reqs)
         return sum(req.remain_len for req in self.running_reqs.values()) + tokens_reserved
 
     def schedule_next_batch(self) -> Batch | None:

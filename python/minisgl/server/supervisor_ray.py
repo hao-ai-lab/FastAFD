@@ -12,6 +12,7 @@ from queue import Empty, Queue
 from typing import TYPE_CHECKING, Any
 
 from minisgl.distributed import DistributedInfo
+from minisgl.ray_env_keys import RAY_ACTOR_ENV_KEYS, RAY_ACTOR_NODE_SCOPED_CACHE_KEYS
 from minisgl.utils import init_logger
 
 from .supervisor import (
@@ -31,74 +32,11 @@ if TYPE_CHECKING:
 # Ray environment helpers
 # ---------------------------------------------------------------------------
 
-_RAY_ENV_KEYS = (
-    "PYTHONPATH",
-    "CONDA_PREFIX",
-    "CONDA_DEFAULT_ENV",
-    "MINISGL_RAY_NSYS_BIN",
-    "MINISGL_RAY_NSYS_CUDA_GRAPH_TRACE",
-    "MINISGL_RAY_NSYS_START_STEP",
-    "MINISGL_RAY_NSYS_STOP_STEP",
-    "MINISGL_AFD_CONTROL_PROFILE_START_STEP",
-    "MINISGL_AFD_CONTROL_PROFILE_STOP_STEP",
-    "MINISGL_NVTX_CPU_TRACE",
-    "NSYS",
-    "NCCL_DEBUG",
-    "NCCL_DEBUG_SUBSYS",
-    "NCCL_SOCKET_IFNAME",
-    "NCCL_IB_HCA",
-    "NCCL_IB_GID_INDEX",
-    "NCCL_IB_TC",
-    "NCCL_IB_SL",
-    "NCCL_NET_GDR_LEVEL",
-    "MINISGL_AFD_ATTN_NODES",
-    "MINISGL_AFD_MLP_NODES",
-    "MINISGL_DEEPEP_BUILD_DIR",
-    "MINISGL_DEEPGEMM_BUILD_DIR",
-    "MINISGL_FP8_QUANT_BACKEND",
-    "MINISGL_QK_NORM_ROPE_BACKEND",
-    "MINISGL_AFD_MOE_BACKEND",
-    "MINISGL_AFD_MAX_COMM_TOKENS",
-    "MINISGL_AFD_DISABLE_DEEPEP_CPU_SYNC",
-    "MINISGL_MEGAMOE_AG_SMS",
-    "MINISGL_MEGAMOE_EG_EXPECTED_TOKENS",
-    "DG_PRINT_CONFIGS",
-    "MINISGL_AFD_STARTUP_TIMEOUT_S",
-    "EP_NCCL_ROOT_DIR",
-    "EP_SUPPRESS_NCCL_CHECK",
-    "EP_JIT_CACHE_DIR",
-    "N2M_M2N_GIN_BUILD_DIR",
-    "PATH",
-    "LD_LIBRARY_PATH",
-    "LIBRARY_PATH",
-    "CUDA_HOME",
-    "CUDA_PATH",
-    "CUDA_NVCC_EXECUTABLE",
-    "DG_JIT_CACHE_DIR",
-    "DG_JIT_NVCC_COMPILER",
-    "DG_JIT_USE_NVRTC",
-    "TRITON_PTXAS_BLACKWELL_PATH",
-    "FLASHINFER_WORKSPACE_BASE",
-    "TVM_FFI_CACHE_DIR",
-    "TORCH_CUDA_ARCH_LIST",
-    "CC",
-    "CXX",
-    "MAX_JOBS",
-    "LOG_LEVEL",
-    "LOG_PID",
-)
+_RAY_ENV_KEYS = RAY_ACTOR_ENV_KEYS
 
 _RAY_NSYS_BIN_ENV = "MINISGL_RAY_NSYS_BIN"
 _RAY_STDIO_HANDLE = None
-_NODE_SCOPED_CACHE_ENV_KEYS = (
-    "FLASHINFER_WORKSPACE_BASE",
-    "TVM_FFI_CACHE_DIR",
-    "EP_JIT_CACHE_DIR",
-    "N2M_M2N_GIN_BUILD_DIR",
-    "MINISGL_DEEPEP_BUILD_DIR",
-    "MINISGL_DEEPGEMM_BUILD_DIR",
-    "DG_JIT_CACHE_DIR",
-)
+_NODE_SCOPED_CACHE_ENV_KEYS = RAY_ACTOR_NODE_SCOPED_CACHE_KEYS
 
 
 def _get_ray_node_resource_key(ray_mod, node_ip: str) -> str:
@@ -186,6 +124,217 @@ def _resolve_nsys_bin(env: dict[str, str] | None = None) -> tuple[str | None, st
     if not (os.path.isfile(explicit_path) and os.access(explicit_path, os.X_OK)):
         return None, f"{_RAY_NSYS_BIN_ENV}={explicit_path!r} is not an executable file"
     return os.path.realpath(explicit_path), None
+
+
+def _probe_nsys_on_node() -> dict[str, Any]:
+    """Look up `nsys` the way Ray's nsight plugin does: a bare name on this process's PATH."""
+    import shutil
+    import subprocess
+
+    result: dict[str, Any] = {
+        "host": socket.gethostname(),
+        "which_nsys": shutil.which("nsys"),
+        "version_rc": None,
+        "version": "",
+    }
+    if result["which_nsys"] is None:
+        return result
+    try:
+        proc = subprocess.run(["nsys", "--version"], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        result["version"] = f"{type(exc).__name__}: {exc}"
+        return result
+    result["version_rc"] = proc.returncode
+    result["version"] = (proc.stdout.strip() or proc.stderr.strip())[:200]
+    return result
+
+
+def _nsys_preflight_error(results: dict[str, dict[str, Any]], nsys_bin: str) -> str | None:
+    """Return an actionable error if any node's Ray daemons cannot run `nsys`, else None.
+
+    Args:
+        results: Node IP -> `_probe_nsys_on_node()` result, or `{"error": ...}` when the probe task failed.
+        nsys_bin: The driver's resolved `MINISGL_RAY_NSYS_BIN`.
+    """
+    failed = {ip for ip, result in results.items() if result.get("version_rc") != 0}
+    if not failed:
+        return None
+    lines = [
+        f"Ray Nsight Systems preflight failed on {len(failed)} of {len(results)} node(s). "
+        "Ray's nsight runtime_env plugin starts a bare `nsys` inside each node's runtime-env agent, "
+        f"which uses the Ray daemon (raylet) PATH; {_RAY_NSYS_BIN_ENV}={nsys_bin} only reaches this "
+        "driver and the actor env_vars, not that agent.",
+        f"Fix: append the nsys directory (for example {os.path.dirname(nsys_bin)}) to PATH in the "
+        "environment that runs `ray start` on the failing node(s), restart those Ray daemons, and retry; "
+        "or run without Nsight profiling (NSYS=0).",
+        "Per-node result (`which nsys` / `nsys --version` as the Ray daemons see it):",
+    ]
+    for ip in sorted(results):
+        result = results[ip]
+        status = "FAIL" if ip in failed else "OK"
+        if "error" in result:
+            detail = f"probe task failed: {result['error']}"
+        else:
+            detail = f"which nsys={result.get('which_nsys')}"
+            if result.get("which_nsys") is not None:
+                detail += f", nsys --version rc={result.get('version_rc')}: {result.get('version')}"
+        lines.append(f"  {status} {ip} ({result.get('host', '?')}): {detail}")
+    return "\n".join(lines)
+
+
+def _preflight_ray_nsys(ray_mod, node_ips: list[str], nsys_bin: str) -> dict[str, dict[str, Any]]:
+    """Fail fast, before any actor with an `nsight` runtime_env exists, if a target node lacks `nsys`.
+
+    Ray's nsight plugin only reports "nsight is not installed" after the actor is scheduled. This probe runs
+    one CPU-only task per node with a runtime_env that sets PYTHONPATH only: actor env_vars forward the
+    driver's PATH, so forwarding it here would hide exactly the raylet PATH the plugin sees.
+
+    Returns:
+        Node IP -> probe result, when every node passes.
+
+    Raises:
+        RuntimeError: With every node's result and the fix, when any node fails.
+    """
+    probe = ray_mod.remote(num_cpus=0, max_retries=0)(_probe_nsys_on_node)
+    runtime_env = {"env_vars": {"PYTHONPATH": str(Path(__file__).resolve().parents[2])}}
+    refs = {
+        ip: probe.options(
+            resources={_get_ray_node_resource_key(ray_mod, ip): 0.001},
+            runtime_env=runtime_env,
+        ).remote()
+        for ip in sorted(set(node_ips))
+    }
+    results: dict[str, dict[str, Any]] = {}
+    for ip, ref in refs.items():
+        try:
+            results[ip] = ray_mod.get(ref, timeout=120)
+        except ray_mod.exceptions.RayError as exc:  # report every node, not only the first failure
+            results[ip] = {"error": f"{type(exc).__name__}: {exc}"}
+    error = _nsys_preflight_error(results, nsys_bin)
+    if error is not None:
+        raise RuntimeError(error)
+    return results
+
+
+# Package versions an AFD worker must share with its driver. The worker runs the Python of the Ray
+# daemons (raylet) on its node, while the driver's PATH, LD_LIBRARY_PATH, CUDA_HOME and CONDA_PREFIX
+# reach it through runtime_env (ray_env_keys.py), so two envs with different versions would be mixed.
+_RUNTIME_VERSION_DISTS = ("torch", "flashinfer-python", "flashinfer-cubin", "triton")
+_RAY_PY_EXECUTABLE_ENV = "MINISGL_RAY_PY_EXECUTABLE"
+
+
+def _probe_runtime_versions() -> dict[str, Any]:
+    """Report this interpreter's prefix, Python patch version and the `_RUNTIME_VERSION_DISTS` versions.
+
+    Reads package metadata only, so it neither imports torch nor initializes CUDA.
+    """
+    import importlib.metadata
+    import platform
+
+    versions: dict[str, str | None] = {"python": platform.python_version()}
+    for dist in _RUNTIME_VERSION_DISTS:
+        try:
+            versions[dist] = importlib.metadata.version(dist)
+        except importlib.metadata.PackageNotFoundError:
+            versions[dist] = None
+    return {"host": socket.gethostname(), "prefix": sys.prefix, "versions": versions}
+
+
+def _format_versions(versions: dict[str, str | None]) -> str:
+    return " ".join(f"{name}={value}" for name, value in versions.items())
+
+
+def _runtime_version_check(
+    driver: dict[str, Any], results: dict[str, dict[str, Any]]
+) -> tuple[str | None, str | None]:
+    """Compare each node's `_probe_runtime_versions()` result with the driver's.
+
+    Args:
+        driver: This driver's `_probe_runtime_versions()` result.
+        results: Node IP -> probe result, or `{"error": ...}` when the probe task failed.
+
+    Returns:
+        (error, warning): an actionable error when any node's versions differ or its probe failed;
+        otherwise a one-line warning when only the env prefix differs (a private clone of the same env),
+        else (None, None).
+    """
+    mismatched = {
+        ip for ip, result in results.items() if "error" in result or result["versions"] != driver["versions"]
+    }
+    if mismatched:
+        lines = [
+            f"FastAFD driver and Ray worker environments differ on {len(mismatched)} of {len(results)} node(s). "
+            "AFD workers run the Python of the Ray daemons (raylet) on their node but receive this driver's "
+            "PATH, LD_LIBRARY_PATH, CUDA_HOME and CONDA_PREFIX (python/minisgl/ray_env_keys.py), so each "
+            "worker would mix two environments.",
+            f"Driver: {driver['prefix']} {_format_versions(driver['versions'])}",
+            "Fix: run the driver from the conda env the Ray daemons were started from (the env given to "
+            "`ray start`, for example through scripts/enter_clean.sh; on a cluster started from a cluster.env, "
+            "its CONDA_ENV), or restart the daemons from the driver's env.",
+            "Per node, as its Ray daemons run it:",
+        ]
+        for ip in sorted(results):
+            result = results[ip]
+            if "error" in result:
+                lines.append(f"  FAIL {ip} (?): probe task failed: {result['error']}")
+                continue
+            detail = f"{result['prefix']} {_format_versions(result['versions'])}"
+            if ip in mismatched:
+                diffs = ", ".join(
+                    f"{name} {result['versions'].get(name)} (driver {value})"
+                    for name, value in driver["versions"].items()
+                    if result["versions"].get(name) != value
+                )
+                lines.append(f"  MISMATCH {ip} ({result['host']}): {detail}; differs: {diffs}")
+            else:
+                lines.append(f"  OK {ip} ({result['host']}): {detail}")
+        return "\n".join(lines), None
+    other_prefix = sorted(ip for ip, result in results.items() if result["prefix"] != driver["prefix"])
+    if other_prefix:
+        prefixes = sorted({results[ip]["prefix"] for ip in other_prefix})
+        return None, (
+            f"FastAFD driver env {driver['prefix']} is not the Ray daemons' env on {', '.join(other_prefix)} "
+            f"({', '.join(prefixes)}); package versions match ({_format_versions(driver['versions'])}), continuing."
+        )
+    return None, None
+
+
+def _preflight_runtime_versions(ray_mod, node_ips: list[str]) -> str | None:
+    """Fail fast, before any AFD actor exists, if a node's Ray daemons run other package versions than this driver.
+
+    One CPU-only task per node with a runtime_env that sets PYTHONPATH only, so it runs the interpreter
+    the raylet gives an AFD worker.
+
+    Returns:
+        A warning to log (env prefix differs but versions match, or the check was skipped), else None.
+
+    Raises:
+        RuntimeError: With the driver's and every node's versions and the fix, when any node differs.
+    """
+    if os.environ.get(_RAY_PY_EXECUTABLE_ENV, "").strip():
+        return (
+            f"FastAFD driver/worker version check skipped: {_RAY_PY_EXECUTABLE_ENV} replaces the workers' "
+            "interpreter, which the probe cannot reproduce."
+        )
+    probe = ray_mod.remote(num_cpus=0, max_retries=0)(_probe_runtime_versions)
+    runtime_env = {"env_vars": {"PYTHONPATH": str(Path(__file__).resolve().parents[2])}}
+    refs = {
+        ip: probe.options(
+            resources={_get_ray_node_resource_key(ray_mod, ip): 0.001},
+            runtime_env=runtime_env,
+        ).remote()
+        for ip in sorted(set(node_ips))
+    }
+    results: dict[str, dict[str, Any]] = {}
+    for ip, ref in refs.items():
+        try:
+            results[ip] = ray_mod.get(ref, timeout=120)
+        except ray_mod.exceptions.RayError as exc:  # report every node, not only the first failure
+            results[ip] = {"error": f"{type(exc).__name__}: {exc}"}
+    error, warning = _runtime_version_check(_probe_runtime_versions(), results)
+    if error is not None:
+        raise RuntimeError(error)
+    return warning
 
 
 def _sanitize_node_tag(node_ip: str) -> str:
@@ -420,6 +569,8 @@ class RayBackendSupervisor:
                     f"{_RAY_NSYS_BIN_ENV} to point to a valid `nsys` binary. "
                     f"Driver check failed: {driver_nsys_error}"
                 )
+            preflight = _preflight_ray_nsys(ray, [node_ip for node_ip, _ in rank_plan], driver_nsys_path)
+            self.logger.info("Ray nsys preflight passed: %s", {ip: r["which_nsys"] for ip, r in preflight.items()})
         base_runtime_env = _build_ray_runtime_env(nsys_bin=driver_nsys_path)
         env_keys = sorted(base_runtime_env["env_vars"])
         self.logger.info("Ray actor env passthrough keys: %s", env_keys or "<none>")

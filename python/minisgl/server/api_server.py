@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Literal, Tuple
 
 import uvicorn
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from minisgl.core import SamplingParams
 from minisgl.env import ENV
@@ -27,6 +27,7 @@ from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
 
 from .args import ServerArgs
+from .prompt_ids import prompt_ids_tensor
 
 logger = init_logger(__name__, "FrontendAPI")
 
@@ -69,6 +70,9 @@ class OpenAICompletionRequest(BaseModel):
 
     prompt: str | None = None
     messages: List[Message] | None = None
+    # MiniSGL extension: the prompt as token ids, used as given (no chat template, no
+    # tokenization). Re-encoding a ~0.8M-token text cost seconds per call.
+    input_ids: List[int] | None = None
 
     max_tokens: int = 16
     temperature: float = 1.0
@@ -305,7 +309,20 @@ async def v1_root():
 @app.post("/v1/chat/completions")
 async def v1_completions(req: OpenAICompletionRequest, request: Request):
     state = get_global_state()
-    if req.messages:
+    ids = None
+    if req.input_ids is not None:
+        if req.messages or req.prompt is not None:
+            raise HTTPException(status_code=400, detail="give input_ids or prompt/messages, not both")
+        try:
+            ids = prompt_ids_tensor(
+                req.input_ids, req.max_tokens,
+                vocab_size=int(state.config.model_config.vocab_size),
+                max_seq_len=int(state.config.max_seq_len),
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        prompt = ""
+    elif req.messages:
         prompt = [msg.model_dump() for msg in req.messages]
     else:
         assert req.prompt is not None, "Either 'messages' or 'prompt' must be provided"
@@ -324,6 +341,7 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
                 top_k=req.top_k,
                 top_p=req.top_p,
             ),
+            input_ids=ids,
         )
     )
 

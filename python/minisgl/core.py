@@ -8,7 +8,7 @@ import torch
 
 if TYPE_CHECKING:
     from minisgl.attention import BaseAttnBackend, BaseAttnMetadata
-    from minisgl.kvcache import BaseCacheHandle, BaseKVCachePool
+    from minisgl.kvcache import BaseCacheHandle, BaseKVCachePool, HybridGDNStatePool
     from minisgl.moe import BaseMoeBackend
 
 
@@ -77,6 +77,9 @@ class Batch:
     positions: torch.Tensor = field(init=False)
     positions_host: torch.Tensor = field(init=False)
     out_loc: torch.Tensor = field(init=False)
+    # Request table slot per flattened token. This remains a mutable device
+    # tensor during CUDA graph replay and addresses GDN recurrent state.
+    state_indices: torch.Tensor = field(init=False)
     padded_reqs: List[Req] = field(init=False)
     # this field should be set by attention backend
     attn_metadata: BaseAttnMetadata = field(init=False)
@@ -124,6 +127,7 @@ class Context:
     attn_backend: BaseAttnBackend = field(init=False)
     moe_backend: BaseMoeBackend = field(init=False)
     kv_cache: BaseKVCachePool = field(init=False)
+    gdn_state_pool: HybridGDNStatePool | None = field(default=None, init=False)
     mlp_deepep_buffer: object | None = None
     moe_num_token_non_padded: torch.Tensor | int | None = None
     moe_deepep_dispatch_max_tokens_per_rank: int | None = None

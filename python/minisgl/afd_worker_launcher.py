@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import time
 from typing import Any
 
@@ -64,7 +65,6 @@ def startup_afd_workers(coord: Any) -> None:
         f"node_gpu_counts={placement.node_gpu_counts}",
         flush=True,
     )
-
     # Stage 2: resolve backend-dependent sizing once on an attention GPU.  Some
     # attention backends choose their page size from the local CUDA/runtime
     # environment, so this cannot be decided purely on the coordinator process.
@@ -108,12 +108,30 @@ def startup_afd_workers(coord: Any) -> None:
             if node_scoped_cache
             else None
         )
-        return runtime_env(
+        env = runtime_env(
             nsight=nsight,
             node_scoped_cache=node_scoped_cache,
             node_ip=node_ip,
             cache_rank_tag=cache_rank_tag,
         )
+        # Optional worker-command wrapper, for running a rank under a tool such as
+        # compute-sanitizer. These actors are spawned by the raylet, so a tool
+        # cannot be attached by wrapping the driver, and the sanitizer's env
+        # injection alone is not enough either -- the target connects back to a
+        # live collection server. Ray's `py_executable` replaces the worker
+        # command, which is the documented hook for exactly this.
+        #
+        # MINISGL_RAY_PY_EXECUTABLE_RANKS restricts it to the ranks worth paying
+        # for; memcheck runs 10-50x slower, so sanitizing all eight ranks of an
+        # AFD job just times out. `ray_rank` here is comm_rank + 1, matching the
+        # nsight options above. Diagnostic only; unset in every measured run.
+        command = os.environ.get("MINISGL_RAY_PY_EXECUTABLE", "").strip()
+        if command:
+            wanted = os.environ.get("MINISGL_RAY_PY_EXECUTABLE_RANKS", "").strip()
+            selected = {r.strip() for r in wanted.split(",") if r.strip()}
+            if not selected or str(int(ray_rank)) in selected:
+                env["py_executable"] = command
+        return env
 
     common_worker_kwargs: dict[str, Any] = {
         "attn_dp_size": layout.attn_dp_size,
@@ -136,6 +154,7 @@ def startup_afd_workers(coord: Any) -> None:
         "device_comm_num_sms": coord.device_comm_num_sms,
         "ray_nsys": bool(coord.server_args.ray_nsys),
         "disable_overlap": bool(coord.server_args.afd_disable_overlap),
+        "async_pending_steps": int(coord.async_pending_steps),
         "afd_num_mb": coord.afd_num_mb,
         "rpc_timeout_ms": coord._rpc_timeout_ms,
         "moe_a2a_backend": coord.server_args.afd_moe_a2a_backend,
@@ -159,6 +178,20 @@ def startup_afd_workers(coord: Any) -> None:
             "distributed_tp_groups": afd_union_tp_groups,
         }
 
+    # CAD decode (MINISGL_AFD_MODE=cad, minisgl.cad): the union world keeps AFD's layout (attention ranks first, the
+    # model node's GPUs last); the MLP actors are CadModelWorker (an AfdExpertWorker that also runs the CAD model side:
+    # prefill EG steps unchanged, decode = the CAD program).
+    from minisgl.cad.config import CadConfig
+
+    cad_cfg = CadConfig.from_env()
+    expert_worker_cls = AfdExpertWorker
+    if cad_cfg.enabled:
+        if int(layout.attn_tp_size) != 1 or int(layout.mlp_tp_size) != 1:
+            raise RuntimeError(f"MINISGL_AFD_MODE=cad v1: attention TP1 and model TP1, got attention TP "
+                               f"{layout.attn_tp_size}, MLP TP {layout.mlp_tp_size}")
+        from minisgl.cad.model_worker import CadModelWorker
+
+        expert_worker_cls = CadModelWorker
     AfdAttentionWorkerActor = ray.remote(
         num_cpus=1,
         num_gpus=1,
@@ -170,7 +203,7 @@ def startup_afd_workers(coord: Any) -> None:
         num_gpus=1,
         max_restarts=0,
         max_task_retries=0,
-    )(AfdExpertWorker)
+    )(expert_worker_cls)
 
     # Stage 6: create attention-side (AG) actors.  Each AG worker owns request/KV
     # state for one attention DP/TP rank and is assigned to the MLP DP rank that

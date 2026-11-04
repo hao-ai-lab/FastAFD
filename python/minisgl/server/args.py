@@ -47,6 +47,8 @@ class ServerArgs(SchedulerConfig):
     afd_report_dir: str = ""
     afd_device_comm_num_sms: int = 1
     afd_disable_overlap: bool = False
+    afd_async_pending_steps: int = 3
+    afd_force_multi_mb_graph_overlap: bool = False
     afd_num_mb: int = 1
 
     @property
@@ -176,6 +178,36 @@ def _validate_afd_parallel_args(
             "1 disables EP, mlp_tp_size is per-MLP-DP EP, and mlp_world is "
             f"full-world EP. Got ep_size={ep_size} mlp_world={mlp_world}."
         )
+
+
+def _afd_multi_mb_graph_requires_serial_steps(kwargs: dict) -> bool:
+    """DeepEP graph instances are not safe with multiple steps in flight.
+
+    This only serializes the coordinator/worker command lead. The per-step
+    multi-microbatch AG/EG pipeline still overlaps its compute and communication
+    lanes.
+    """
+    graph_requested = bool(kwargs.get("afd_decode_graph_bs")) or int(
+        kwargs.get("cuda_graph_max_bs") or 0
+    ) > 0
+    return (
+        kwargs.get("mode") == "afd-serve"
+        and int(kwargs.get("afd_num_mb") or 1) > 1
+        and bool(kwargs.get("afd_enable_attention_decode_graph"))
+        and bool(kwargs.get("afd_enable_model_decode_graph"))
+        and graph_requested
+    )
+
+
+def _afd_multi_mb_graph_auto_serializes(kwargs: dict) -> bool:
+    # DeepEP's captured collectives are not re-entrant. MegaMoE M2N has
+    # lane-owned graph buffers and does not need this cross-step fallback.
+    return (
+        _afd_multi_mb_graph_requires_serial_steps(kwargs)
+        and os.environ.get("MINISGL_AFD_MOE_BACKEND", "deepep") != "megamoe_m2n"
+        and not bool(kwargs.get("afd_disable_overlap"))
+        and not bool(kwargs.get("afd_force_multi_mb_graph_overlap"))
+    )
 
 
 def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bool]:
@@ -393,7 +425,8 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         type=str,
         default=ServerArgs.cache_type,
         choices=SUPPORTED_CACHE_MANAGER.supported_names(),
-        help="The KV cache management strategy.",
+        help="The KV cache management strategy. radix: a GPU prefix cache. afd-serve takes "
+        "naive only (its coordinator's prefix cache is MINISGL_AFD_PREFIX_CACHE).",
     )
 
     parser.add_argument(
@@ -630,6 +663,26 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     )
 
     parser.add_argument(
+        "--afd-async-pending-steps",
+        type=int,
+        default=ServerArgs.afd_async_pending_steps,
+        help=(
+            "Maximum number of outstanding global AFD steps in overlap mode. "
+            "The workers launch this window before retiring the oldest reply."
+        ),
+    )
+
+    parser.add_argument(
+        "--afd-force-multi-mb-graph-overlap",
+        action="store_true",
+        default=ServerArgs.afd_force_multi_mb_graph_overlap,
+        help=(
+            "Diagnostic opt-in: allow cross-step overlap for multi-MB decode "
+            "graphs despite the collective re-entry safety guard."
+        ),
+    )
+
+    parser.add_argument(
         "--afd-num-mb",
         type=int,
         default=ServerArgs.afd_num_mb,
@@ -702,9 +755,38 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         )
         if cap >= 1:
             kwargs["cuda_graph_max_bs"] = min(cap, 512)
+    if int(kwargs["afd_async_pending_steps"]) < 2:
+        parser.error("--afd-async-pending-steps must be >= 2")
+    if bool(kwargs["afd_force_multi_mb_graph_overlap"]) and bool(
+        kwargs["afd_disable_overlap"]
+    ):
+        parser.error(
+            "--afd-force-multi-mb-graph-overlap conflicts with --afd-disable-overlap"
+        )
+    auto_serialized_graph_steps = _afd_multi_mb_graph_auto_serializes(kwargs)
+    if auto_serialized_graph_steps:
+        kwargs["afd_disable_overlap"] = True
     _validate_afd_parallel_args(parser, kwargs)
+    if kwargs["mode"] == "afd-serve":
+        # forwarded to the AFD workers (minisgl.ray_env_keys), which build their own config
+        os.environ.setdefault("MINISGL_AFD_DIST_TIMEOUT", str(float(kwargs["distributed_timeout"])))
 
     result = ServerArgs(**kwargs)
     logger = init_logger(__name__)
+    if auto_serialized_graph_steps:
+        logger.warning(
+            "AFD multi-MB decode graphs serialize cross-step command launch to "
+            "avoid re-entering captured DeepEP collectives; within-step "
+            "microbatch compute/communication overlap remains enabled."
+        )
+    elif (
+        bool(kwargs["afd_force_multi_mb_graph_overlap"])
+        and _afd_multi_mb_graph_requires_serial_steps(kwargs)
+    ):
+        logger.warning(
+            "AFD multi-MB decode graph cross-step overlap is FORCE ENABLED for "
+            "diagnostic profiling; async_pending_steps=%d",
+            int(kwargs["afd_async_pending_steps"]),
+        )
     logger.info(f"Parsed arguments:\n{result}")
     return result, run_shell

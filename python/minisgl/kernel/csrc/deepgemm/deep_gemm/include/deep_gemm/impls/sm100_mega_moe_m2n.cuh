@@ -158,8 +158,15 @@ CUTLASS_DEVICE void ag_timing_store(
     const AGTimingSlot& slot,
     const unsigned long long& value) {
     auto ptr = ag_timing_ptr(debug_timings, slot);
-    if (ptr != nullptr)
+    if (ptr != nullptr) {
         *ptr = value;
+        // System-scope fence so the value is visible off-device. Without it the
+        // store can sit in L2 until the kernel completes, and a kernel that TRAPS
+        // never completes -- which loses exactly the progress markers that say how
+        // far it got. Only reached when timing is enabled, so it costs nothing in
+        // a measured run.
+        __threadfence_system();
+    }
 }
 
 template <uint32_t kNumLanes>
@@ -229,6 +236,20 @@ template <
     bool kExternalQuant = false,
     bool kDirectCombine = false,
     bool kEnableDebugTiming = false,
+    // Point-to-point protocol (layout::P2PRegionsM2N) instead of the union-wide
+    // tag-2/tag-3 barriers: AG ranks never wait for each other, only for the EG
+    // ranks. Every rank of the union must use the same protocol.
+    bool kP2P = false,
+    // Push dispatch: the quant also writes each token's payload, SF and top-k
+    // weights into every EG rank's staging rows of this rank, so the EG ranks
+    // read them locally instead of pulling them over the fabric while this
+    // rank's HBM is busy with attention (in-kernel quant, host gate only).
+    bool kPushDispatch = false,
+    // Combine-only launch (P2P) behind a wait kernel that already saw this
+    // rank's combine counter complete (an acquire at system scope, ordered before
+    // this launch by the stream) and cleared it: no counter wait and no grid
+    // sync here, so the CTAs reduce as soon as each is resident.
+    bool kWaitedCombine = false,
     uint32_t kNumRanks = kNumAGRanks + kNumEGRanks,
     uint32_t kNumDispatchWarps = kNumDispatchThreads / 32,
     uint32_t kNumCombineWarps = kNumCombineThreads / 32,
@@ -246,6 +267,8 @@ sm100_mega_moe_m2n_ag_impl(void* y,
                            const uint32_t num_tokens,
                            const float shared_topk_weight,
                            unsigned long long* debug_timings,
+                           // P2P: parity of the model layer, which indexes the combine counter
+                           const uint32_t layer_parity,
                            const __grid_constant__ layout::SymBuffer<kNumRanks> sym_buffer) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)) or defined(__CLION_IDE__)
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
@@ -311,6 +334,14 @@ sm100_mega_moe_m2n_ag_impl(void* y,
         fp8_intermediate_sf_layout, 1, kNumPaddedSFPoolTokens, l2_token_buffer.get_end_ptr());
     const auto combine_token_buffer = layout::Buffer(
         bf16_token_layout, kNumTopk, kNumMaxTokensPerRank, l2_sf_buffer.get_end_ptr());
+    // Push-dispatch staging (EG ranks): [source AG rank][its token] rows
+    const auto staging_token_buffer = layout::Buffer(
+        fp8_token_layout, kNumAGRanks, kNumMaxTokensPerRank, combine_token_buffer.get_end_ptr());
+    const auto staging_sf_buffer = layout::Buffer(
+        fp8_sf_layout, kNumAGRanks, kNumMaxTokensPerRank, staging_token_buffer.get_end_ptr());
+    const auto staging_topk_weights_buffer = layout::Buffer(
+        input_topk_weights_layout, kNumAGRanks, kNumMaxTokensPerRank, staging_sf_buffer.get_end_ptr());
+    const auto p2p_ctrl = layout::P2PRegionsM2N(staging_topk_weights_buffer.get_end_ptr());
 
     // Shared memory: combine chunk slots first (reused as nothing else after
     // dispatch), expert counters next, barriers last.
@@ -336,7 +367,9 @@ sm100_mega_moe_m2n_ag_impl(void* y,
     // Initialization
     if (warp_idx == 0) {
         if (cute::elect_one_sync())
-            ptx::st_shared_bulk(smem_expert_count, kNumExperts * sizeof(uint32_t));
+            // st.bulk stores whole 8-byte words: an odd expert count (a remote
+            // shared-expert slot per EG rank) would leave the last counter unset
+            ptx::st_shared_bulk(smem_expert_count, math::constexpr_align<uint32_t>(kNumExperts * sizeof(uint32_t), 8));
     } else if (warp_idx == 1) {
         #pragma unroll
         for (uint32_t i = lane_idx; i < kNumCombineWarps * 2; i += 32)
@@ -360,13 +393,55 @@ sm100_mega_moe_m2n_ag_impl(void* y,
     // the inter-layer attention window hides the cross-rank latency.  It must
     // complete before phase 0 overwrites x/sf/weights that the EG ranks may
     // still be pulling, and before any remote workspace write.
+    // P2P: the credits gate only the remote count/index slot pushes, so each SM
+    // reads them here, checks the value right before its index pushes (below),
+    // after the quant hid the load's latency: no grid sync up front. The credit
+    // word only grows (the EG ranks add one each per round): a round's credits
+    // are in once it passed what earlier rounds consumed by kNumEGRanks; the last
+    // SM to check advances the consumed word (nobody waits for anybody).
+    constexpr bool kLateCredits = kP2P and not kPushDispatch;
+    int credit_seen = 0, credit_target = 0;
+    if constexpr (kAGPhase != 2 and kLateCredits) {
+        if (thread_idx == 0) {
+            credit_target = *reinterpret_cast<volatile int*>(p2p_ctrl.get_credit_consumed_ptr()) +
+                            static_cast<int>(kNumEGRanks);
+            credit_seen = ptx::ld_acq_sys(p2p_ctrl.get_credit_ptr());
+        }
+    }
     if constexpr (kAGPhase != 2) {
         unsigned long long timing_t0 = do_timing_dispatch_leader ? clock64() : 0;
+        if constexpr (kLateCredits) {
+            // (see above)
+        } else if constexpr (kP2P) {
+            // Credits: every EG rank cleaned this lane's workspace after its
+            // previous round, so the count/index slots can be pushed again. The
+            // x/sf/weights rewrite below is already safe: the previous combine
+            // on this lane waited for every EG rank's write-back, which follows
+            // its pulls. The next credits only come after this launch's count
+            // push; taking the round's credits off (rather than zeroing) keeps
+            // even an early one.
+            if (sm_idx == 0 and thread_idx == 0) {
+                const auto credit_ptr = p2p_ctrl.get_credit_ptr();
+                constexpr int64_t kNumTimeoutCycles = 300ll * 2000000000ll;
+                const auto start_clock = clock64();
+                while (ptx::ld_acq_sys(credit_ptr) < static_cast<int>(kNumEGRanks)) {
+                    if (clock64() - start_clock >= kNumTimeoutCycles) {
+                        printf("MegaMoE M2N P2P credit timeout (300s): rank=%d credit=%d target=%d\n",
+                               sym_buffer.rank_idx, ptx::ld_acq_sys(credit_ptr), static_cast<int>(kNumEGRanks));
+                        DG_DEVICE_ASSERT(false and "P2P credit timeout");
+                    }
+                }
+                atomicSub_system(credit_ptr, static_cast<int>(kNumEGRanks));
+            }
+            comm::grid_sync<kNumSMs, kDispatchGridSyncIndex>(
+                workspace, sm_idx, thread_idx, [=]() { __syncthreads(); });
+        } else {
         comm::nvlink_barrier_wait<kNumRanks, kNumSMs, kNumThreads,
                                   kDispatchGridSyncIndex, kAfterWorkspaceCleanBarrierTag>(
             workspace, sym_buffer, sm_idx, thread_idx,
             [=]() { __syncthreads(); }
         );
+        }
         if (do_timing_dispatch_leader) {
             const auto timing_t1 = clock64();
             m2n_detail::ag_timing_add(debug_timings, m2n_detail::AGTimingSlot::Tag3Wait, timing_t1 - timing_t0);
@@ -384,13 +459,15 @@ sm100_mega_moe_m2n_ag_impl(void* y,
         unsigned long long timing_t0 = do_timing_dispatch_leader ? clock64() : 0;
         constexpr uint32_t kNumGroups = kHidden / 32;
         constexpr uint32_t kNumWarps = kNumThreads / 32;
+        constexpr uint32_t kTokenBytes = kHidden;
+        constexpr uint32_t kSfBytesPerToken = kNumGroups;
         const auto x_base = input_token_buffer.get_base_ptr<uint8_t>();
         const auto sf_base = input_sf_buffer.get_base_ptr<uint8_t>();
         const auto w_base = input_topk_weights_buffer.get_base_ptr<float>();
         for (uint32_t t = sm_idx * kNumWarps + warp_idx; t < num_tokens; t += kNumSMs * kNumWarps) {
             const auto src = hidden_bf16 + t * kHidden;
-            const auto x_row = x_base + t * kHidden;
-            const auto sf_row = sf_base + t * kNumGroups;
+            const auto x_row = x_base + t * kTokenBytes;
+            const auto sf_row = sf_base + t * kSfBytesPerToken;
             #pragma unroll
             for (uint32_t g = lane_idx; g < kNumGroups; g += 32) {
                 uint4 raw[4];
@@ -438,6 +515,45 @@ sm100_mega_moe_m2n_ag_impl(void* y,
             }
         }
         __syncthreads();
+        if constexpr (kPushDispatch) {
+            // This CTA's tokens (the quant loop's mapping), now complete in the
+            // local rows, into this rank's staging rows on every EG rank, by the
+            // dispatch warps: the writes overlap the gate, count and index pushes,
+            // and the fence ahead of the count push orders them before the counts.
+            if (warp_idx < kNumDispatchWarps) {
+                constexpr uint32_t kTokenUint4 = kTokenBytes / 16;
+                constexpr uint32_t kSfUint4 = kSfBytesPerToken / 16;
+                constexpr uint32_t kWeightUint4 = kNumTopk * sizeof(float) / 16;
+                DG_STATIC_ASSERT(kTokenBytes % 16 == 0 and kSfBytesPerToken % 16 == 0 and
+                                 (kNumTopk * sizeof(float)) % 16 == 0, "Unaligned staging rows");
+                for (uint32_t j = warp_idx; ; j += kNumDispatchWarps) {
+                    const uint32_t t = sm_idx * kNumWarps + j % kNumWarps + (j / kNumWarps) * kNumSMs * kNumWarps;
+                    if (t >= num_tokens)
+                        break;
+                    const auto x_src = reinterpret_cast<const uint4*>(x_base + t * kTokenBytes);
+                    const auto sf_src = reinterpret_cast<const uint4*>(sf_base + t * kSfBytesPerToken);
+                    const auto w_src = reinterpret_cast<const uint4*>(w_base + t * kNumTopk);
+                    const auto x_dst = staging_token_buffer.get_rank_buffer(sym_buffer.rank_idx)
+                                       .get_data_buffer(t).get_base_ptr<uint4>();
+                    const auto sf_dst = staging_sf_buffer.get_rank_buffer(sym_buffer.rank_idx)
+                                        .get_data_buffer(t).get_base_ptr<uint4>();
+                    const auto w_dst = staging_topk_weights_buffer.get_rank_buffer(sym_buffer.rank_idx)
+                                       .get_data_buffer(t).get_base_ptr<uint4>();
+                    #pragma unroll
+                    for (uint32_t e = 0; e < kNumEGRanks; ++ e) {
+                        const uint32_t dst_rank = kNumAGRanks + e;
+                        for (uint32_t i = lane_idx; i < kTokenUint4; i += 32)
+                            sym_buffer.map(x_dst, dst_rank)[i] = x_src[i];
+                        for (uint32_t i = lane_idx; i < kSfUint4 + kWeightUint4; i += 32) {
+                            if (i < kSfUint4)
+                                sym_buffer.map(sf_dst, dst_rank)[i] = sf_src[i];
+                            else
+                                sym_buffer.map(w_dst, dst_rank)[i - kSfUint4] = w_src[i - kSfUint4];
+                        }
+                    }
+                }
+            }
+        }
         if (do_timing_dispatch_leader) {
             const auto timing_t1 = clock64();
             m2n_detail::ag_timing_add(debug_timings, m2n_detail::AGTimingSlot::Quant, timing_t1 - timing_t0);
@@ -644,12 +760,57 @@ sm100_mega_moe_m2n_ag_impl(void* y,
             }
         };
 
-        // Count experts' tokens
+        // P2P: every SM scans the whole (small) route: its slots of an expert start
+        // after those of the SMs before it (read_topk_idx's token -> SM map), and SM 0
+        // also counts each expert's total. No global send counters, so no atomic
+        // round trips and no grid sync ahead of the count push (push dispatch keeps
+        // that sync: its staging rows have no per-row readiness).
+        constexpr bool kLocalOffsets = kP2P;
+        const auto smem_expert_total = reinterpret_cast<uint32_t*>(smem_buffer);  // SM 0, phase 0/1
         unsigned long long timing_t0 = do_timing_dispatch_leader ? clock64() : 0;
+        if constexpr (kLocalOffsets) {
+            DG_STATIC_ASSERT(kNumExperts * sizeof(uint32_t) <= SMEM_CHUNK_SIZE, "No room for the totals");
+            if (sm_idx == 0) {
+                for (uint32_t i = thread_idx; i < kNumExperts; i += kNumDispatchThreads)
+                    smem_expert_total[i] = 0;
+                ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
+            }
+            constexpr uint32_t kNumWarpSlots = kNumSMs * kNumDispatchWarps;
+            for (uint32_t p = thread_idx; p < num_tokens * kNumTopk; p += kNumDispatchThreads) {
+                const uint32_t token_idx = p / kNumTopk, topk_slot = p % kNumTopk;
+                const uint32_t owner_sm = (token_idx / kNumTokensPerWarp) % kNumWarpSlots / kNumDispatchWarps;
+                if (sm_idx != 0 and owner_sm >= sm_idx)
+                    continue;
+                int expert_idx = -1;
+                if (topk_slot < kInputTopk) {
+                    const int real_expert_idx = static_cast<int>(
+                        __ldg(route_ids + token_idx * kInputTopk + topk_slot));
+                    if constexpr (kNumRoutedExperts == kNumExperts) {
+                        expert_idx = real_expert_idx;
+                    } else if (real_expert_idx >= 0) {
+                        expert_idx = static_cast<int>(
+                            static_cast<uint32_t>(real_expert_idx) / kNumRoutedExpertsPerEGRank * kNumExpertsPerEGRank +
+                            static_cast<uint32_t>(real_expert_idx) % kNumRoutedExpertsPerEGRank);
+                    }
+                } else if constexpr (kInputTopk < kNumTopk) {
+                    if (topk_slot == kInputTopk)
+                        expert_idx = static_cast<int>(
+                            sym_buffer.rank_idx % kNumEGRanks * kNumExpertsPerEGRank + kNumRoutedExpertsPerEGRank);
+                }
+                if (expert_idx < 0)
+                    continue;
+                if (owner_sm < sm_idx)
+                    atomicAdd_block(smem_expert_count + expert_idx, 1);
+                if (sm_idx == 0)
+                    atomicAdd_block(smem_expert_total + expert_idx, 1);
+            }
+            ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
+        } else {
         read_topk_idx([&](const uint32_t& token_topk_idx, const int& expert_idx) {
            atomicAdd_block(smem_expert_count + expert_idx, 1);
         });
         ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
+        }
         if (do_timing_dispatch_leader) {
             const auto timing_t1 = clock64();
             m2n_detail::ag_timing_add(debug_timings, m2n_detail::AGTimingSlot::DispatchCount, timing_t1 - timing_t0);
@@ -658,17 +819,42 @@ sm100_mega_moe_m2n_ag_impl(void* y,
 
         // Get SM offsets in the global send counters
         timing_t0 = do_timing_dispatch_leader ? clock64() : 0;
+        // (an expert none of this SM's tokens chose needs no offset: only the low
+        // 32 bits of the sums are ever read, so it skips the atomic round trip)
+        if constexpr (not kLocalOffsets) {
         #pragma unroll
         for (uint32_t i = thread_idx; i < kNumExperts; i += kNumDispatchThreads) {
-            const uint64_t send_value = (1ull << 32) | static_cast<uint64_t>(smem_expert_count[i]);
-            smem_expert_count[i] = static_cast<uint32_t>(
-                ptx::atomic_add(workspace.get_expert_send_count_ptr(i), send_value));
+            const uint32_t local_count = smem_expert_count[i];
+            if (local_count != 0) {
+                const uint64_t send_value = (1ull << 32) | static_cast<uint64_t>(local_count);
+                smem_expert_count[i] = static_cast<uint32_t>(
+                    ptx::atomic_add(workspace.get_expert_send_count_ptr(i), send_value));
+            }
         }
         ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
+        }
         if (do_timing_dispatch_leader) {
             const auto timing_t1 = clock64();
             m2n_detail::ag_timing_add(debug_timings, m2n_detail::AGTimingSlot::DispatchOffsets, timing_t1 - timing_t0);
             m2n_detail::ag_timing_store(debug_timings, m2n_detail::AGTimingSlot::DispatchOffsetsEndTime, timing_t1);
+        }
+
+        // P2P: this lane's slots on every EG rank are free again (see the credits
+        // above); every SM checks before it pushes, SM 0 takes them off later
+        if constexpr (kLateCredits) {
+            if (thread_idx == 0 and credit_seen - credit_target < 0) {
+                const auto credit_ptr = p2p_ctrl.get_credit_ptr();
+                constexpr int64_t kNumTimeoutCycles = 300ll * 2000000000ll;
+                const auto start_clock = clock64();
+                while (ptx::ld_acq_sys(credit_ptr) - credit_target < 0) {
+                    if (clock64() - start_clock >= kNumTimeoutCycles) {
+                        printf("MegaMoE M2N P2P credit timeout (300s): rank=%d sm=%u credit=%d target=%d\n",
+                               sym_buffer.rank_idx, sm_idx, ptx::ld_acq_sys(credit_ptr), credit_target);
+                        DG_DEVICE_ASSERT(false and "P2P credit timeout");
+                    }
+                }
+            }
+            ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
         }
 
         // Write source indices into the owner EG rank's slots
@@ -678,7 +864,9 @@ sm100_mega_moe_m2n_ag_impl(void* y,
             const auto dst_slot_idx = atomicAdd_block(smem_expert_count + expert_idx, 1);
             const auto dst_ptr = workspace.get_src_token_topk_idx_ptr(
                 expert_idx % kNumExpertsPerEGRank, sym_buffer.rank_idx, dst_slot_idx);
-            *sym_buffer.map(dst_ptr, dst_rank_idx) = token_topk_idx;
+            // + 1: the EG waits for a non-zero slot and clears it (P2P: nothing orders
+            // these remote stores before the count push)
+            *sym_buffer.map(dst_ptr, dst_rank_idx) = token_topk_idx + 1;
         });
         if (do_timing_dispatch_leader) {
             const auto timing_t1 = clock64();
@@ -686,12 +874,23 @@ sm100_mega_moe_m2n_ag_impl(void* y,
             m2n_detail::ag_timing_store(debug_timings, m2n_detail::AGTimingSlot::DispatchIndexPushEndTime, timing_t1);
         }
 
-        // Grid sync
+        // Grid sync. P2P keeps it whenever this kernel quantized the tokens: the EG
+        // pulls a token's x / sf / top-k weight rows once the counts are in, and the
+        // quant loop and the dispatch loop map tokens to SMs differently, so an SM can
+        // push the indices (SM 0 also the counts) of a token another SM has not
+        // quantized yet, and the EG would pull the previous layer's rows. With
+        // external quant an earlier kernel wrote them. Push dispatch keeps it too: each
+        // dispatch thread's staging writes reach the EG ranks first (issued during the
+        // quant, they are mostly done by now).
         timing_t0 = do_timing_dispatch_leader ? clock64() : 0;
+        if constexpr (kPushDispatch)
+            __threadfence_system();
+        if constexpr (not kLocalOffsets or kPushDispatch or not kExternalQuant) {
         comm::grid_sync<kNumSMs, kDispatchGridSyncIndex>(
             workspace, sm_idx, thread_idx,
             [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); }
         );
+        }
         if (do_timing_dispatch_leader) {
             const auto timing_t1 = clock64();
             m2n_detail::ag_timing_add(debug_timings, m2n_detail::AGTimingSlot::DispatchGridSync, timing_t1 - timing_t0);
@@ -699,27 +898,61 @@ sm100_mega_moe_m2n_ag_impl(void* y,
         }
 
         // Write expert counts to the owner EG ranks.  The high 32 bits are
-        // re-packed to 1 per source rank, so EG waits for `kNumAGRanks`.
+        // re-packed to 1 per source rank, so EG waits for `kNumAGRanks`. The
+        // per-source slot carries the same 1 in its high half: an early-start EG
+        // pass reads one source's counts from it without waiting for the others.
         timing_t0 = do_timing_dispatch_leader ? clock64() : 0;
         if (sm_idx == 0) {
             #pragma unroll
             for (uint32_t i = thread_idx; i < kNumExperts; i += kNumDispatchThreads) {
                 const auto dst_rank_idx = kNumAGRanks + i / kNumExpertsPerEGRank;
                 const auto dst_local_expert_idx = i % kNumExpertsPerEGRank;
-                const auto expert_status = *workspace.get_expert_send_count_ptr(i);
+                const uint64_t expert_status = kLocalOffsets
+                    ? static_cast<uint64_t>(smem_expert_total[i])
+                    : *workspace.get_expert_send_count_ptr(i);
+                // Nothing orders the remote stores an EG rank reads once an expert's sum
+                // is complete (this slot, every SM's source index slots) before the sum
+                // add, and they take separate NVLink transactions. The EG re-reads the
+                // slots until they add up to the sum (an early-start pass, which serves
+                // only some sources, waits for each slot's push marker instead) and waits
+                // for each index slot's non-zero value, which costs the AG nothing (a
+                // system-scope release here cost 1.3%).
                 *sym_buffer.map(
                     workspace.get_expert_recv_count_ptr(sym_buffer.rank_idx, dst_local_expert_idx),
-                    dst_rank_idx) = expert_status & 0xffffffff;
+                    dst_rank_idx) = (1ull << 32) | (expert_status & 0xffffffff);
                 ptx::atomic_add_sys(
                     sym_buffer.map(workspace.get_expert_recv_count_sum_ptr(dst_local_expert_idx), dst_rank_idx),
                     (1ull << 32) | (expert_status & 0xffffffff));
             }
         }
         ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
+        // P2P: this rank's bit in each EG rank's arrival word, for its early-start
+        // decision; only a hint, so it needs no ordering after the slot stores
+        if constexpr (kP2P and kNumAGRanks <= 24) {
+            if (sm_idx == 0 and thread_idx < kNumEGRanks)
+                ptx::red_or_sys(sym_buffer.map(p2p_ctrl.get_eg_arrival_ptr(), kNumAGRanks + thread_idx),
+                                static_cast<int>(1u << sym_buffer.rank_idx));
+        }
+        // This SM checked the credits: the last SM to get here advances the consumed
+        // word for the next round's launch (every SM read it before its check).
+        if constexpr (kLateCredits) {
+            if (thread_idx == 0 and atomicAdd(p2p_ctrl.get_credit_checked_ptr(), 1) == static_cast<int>(kNumSMs) - 1) {
+                *p2p_ctrl.get_credit_checked_ptr() = 0;
+                *p2p_ctrl.get_credit_consumed_ptr() = credit_target;
+            }
+        }
         if (do_timing_dispatch_leader) {
             const auto timing_t1 = clock64();
             m2n_detail::ag_timing_add(debug_timings, m2n_detail::AGTimingSlot::DispatchCountPush, timing_t1 - timing_t0);
             m2n_detail::ag_timing_store(debug_timings, m2n_detail::AGTimingSlot::DispatchCountPushEndTime, timing_t1);
+        }
+
+        // P2P: the dispatching rank's own release on the combine counter of the
+        // rank that reduces these tokens (this rank), after the count push: a
+        // round is complete at kNumEGRanks + 1.
+        if constexpr (kP2P) {
+            if (sm_idx == 0 and thread_idx == 0)
+                ptx::red_add_rel_sys(p2p_ctrl.get_combine_count_ptr(layer_parity), 1);
         }
 
         // No barrier before EG pulls: the per-rank release on the count push
@@ -750,12 +983,14 @@ sm100_mega_moe_m2n_ag_impl(void* y,
         // deferred into the next kernel launch, where the inter-layer gap
         // has already hidden the cross-rank latency.
         unsigned long long timing_t0 = do_timing_dispatch_leader ? clock64() : 0;
+        if constexpr (not kP2P) {
         comm::nvlink_barrier_arrive<kNumRanks, kNumSMs, kNumDispatchThreads,
                                     kDispatchGridSyncIndex, kAfterWorkspaceCleanBarrierTag>(
             workspace, sym_buffer, sm_idx, thread_idx,
             [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); },
             true
         );
+        }
         if (do_timing_dispatch_leader) {
             const auto timing_t1 = clock64();
             m2n_detail::ag_timing_add(debug_timings, m2n_detail::AGTimingSlot::CleanupArrive, timing_t1 - timing_t0);
@@ -774,11 +1009,38 @@ sm100_mega_moe_m2n_ag_impl(void* y,
         unsigned long long timing_t0 = do_timing_combine_leader ? clock64() : 0;
         if (do_timing_combine_leader)
             m2n_detail::ag_timing_store(debug_timings, m2n_detail::AGTimingSlot::CombineBarrierStartTime, timing_t0);
+        if constexpr (kP2P and kWaitedCombine) {
+            // the wait kernel in front of this launch did both
+        } else if constexpr (kP2P) {
+            // Every EG rank wrote its rows (and released), and so did the rank
+            // that dispatched these tokens. This round's target is taken off
+            // rather than the counter zeroed: with EG early start, a first pass can
+            // release another source that runs two layers ahead and adds to this
+            // parity's counter before this launch consumes it.
+            if (sm_idx == 0 and combine_thread_idx == 0) {
+                const auto count_ptr = p2p_ctrl.get_combine_count_ptr(layer_parity);
+                constexpr int target = static_cast<int>(kNumEGRanks) + 1;
+                constexpr int64_t kNumTimeoutCycles = 300ll * 2000000000ll;
+                const auto start_clock = clock64();
+                while (ptx::ld_acq_sys(count_ptr) < target) {
+                    if (clock64() - start_clock >= kNumTimeoutCycles) {
+                        printf("MegaMoE M2N P2P combine timeout (300s): rank=%d parity=%u count=%d target=%d\n",
+                               sym_buffer.rank_idx, layer_parity, ptx::ld_acq_sys(count_ptr), target);
+                        DG_DEVICE_ASSERT(false and "P2P combine timeout");
+                    }
+                }
+                atomicSub_system(count_ptr, target);
+            }
+            comm::grid_sync<kNumSMs, kEpilogueGridSyncIndex>(
+                workspace, sm_idx, combine_thread_idx,
+                [&]() { ptx::sync_aligned(kNumCombineThreads, kEpilogueFullBarrierIdx); });
+        } else {
         comm::nvlink_barrier<kNumRanks, kNumSMs, kNumCombineThreads,
                              kEpilogueGridSyncIndex, kBeforeCombineReduceBarrierTag>(
             workspace, sym_buffer, sm_idx, combine_thread_idx,
             [&]() { ptx::sync_aligned(kNumCombineThreads, kEpilogueFullBarrierIdx); }
         );
+        }
         if (do_timing_combine_leader) {
             const auto timing_t1 = clock64();
             m2n_detail::ag_timing_add(debug_timings, m2n_detail::AGTimingSlot::CombineBarrierWait, timing_t1 - timing_t0);
@@ -809,6 +1071,69 @@ sm100_mega_moe_m2n_ag_impl(void* y,
             return combine_barriers[i + combine_warp_idx * 2];
         });
 
+        // Combine-only launch: a token's top-k rows are all read at once (plain
+        // loads, not two at a time behind TMA barriers), and its hidden is cut into
+        // 1 KB pieces so every warp of the grid gets work even at a decode batch:
+        // one HBM round trip per piece instead of one per row. Same slot order and
+        // the same fp32 accumulation as the loop below: bit for bit the same output.
+        constexpr bool kSplitCombine = kAGPhase == 2 and not kDirectCombine;
+        if constexpr (kSplitCombine) {
+            constexpr uint32_t kPieceUint4PerLane = 2;
+            constexpr uint32_t kPieceUint4 = 32 * kPieceUint4PerLane;
+            constexpr uint32_t kHiddenUint4 = kNumHiddenBytes / sizeof(uint4);
+            DG_STATIC_ASSERT(kHiddenUint4 % kPieceUint4 == 0, "Hidden must split into 1 KB combine pieces");
+            constexpr uint32_t kNumPieces = kHiddenUint4 / kPieceUint4;
+            const uint32_t num_items = num_tokens * kNumPieces;
+            for (uint32_t item = sm_idx * kNumCombineWarps + combine_warp_idx; item < num_items;
+                 item += kNumSMs * kNumCombineWarps) {
+                const uint32_t token_idx = item / kNumPieces;
+                const uint32_t piece_offset = (item % kNumPieces) * kPieceUint4;
+                int stored_topk_slot_idx = -1;
+                if (lane_idx < kInputTopk) {
+                    stored_topk_slot_idx =
+                        static_cast<int>(__ldg(route_ids + token_idx * kInputTopk + lane_idx));
+                } else if constexpr (kInputTopk < kNumTopk) {
+                    if (lane_idx == kInputTopk)
+                        stored_topk_slot_idx = static_cast<int>(kNumRoutedExperts);
+                }
+                const uint32_t total_mask = __ballot_sync(0xffffffff, stored_topk_slot_idx >= 0);
+
+                uint4 rows[kNumTopk][kPieceUint4PerLane];
+                #pragma unroll
+                for (uint32_t s = 0; s < kNumTopk; ++ s) {
+                    if ((total_mask >> s) & 1u) {
+                        const auto src = combine_token_buffer.get_rank_buffer(s)
+                                         .get_data_buffer(token_idx).get_base_ptr<uint4>() + piece_offset;
+                        #pragma unroll
+                        for (uint32_t j = 0; j < kPieceUint4PerLane; ++ j)
+                            rows[s][j] = __ldg(src + j * 32 + lane_idx);
+                    }
+                }
+                float2 reduced[kPieceUint4PerLane * kNumElemsPerUint4] = {};
+                #pragma unroll
+                for (uint32_t s = 0; s < kNumTopk; ++ s) {
+                    if ((total_mask >> s) & 1u) {
+                        #pragma unroll
+                        for (uint32_t j = 0; j < kPieceUint4PerLane; ++ j) {
+                            const auto bf16_values = reinterpret_cast<const nv_bfloat162*>(&rows[s][j]);
+                            #pragma unroll
+                            for (uint32_t l = 0; l < kNumElemsPerUint4; ++ l)
+                                ptx::accumulate(reduced[j * kNumElemsPerUint4 + l], bf16_values[l]);
+                        }
+                    }
+                }
+                const auto dst = math::advance_ptr<uint4>(y, static_cast<uint64_t>(token_idx) * kNumHiddenBytes) + piece_offset;
+                #pragma unroll
+                for (uint32_t j = 0; j < kPieceUint4PerLane; ++ j) {
+                    uint4 casted;
+                    auto casted_bf16 = reinterpret_cast<nv_bfloat162*>(&casted);
+                    #pragma unroll
+                    for (uint32_t l = 0; l < kNumElemsPerUint4; ++ l)
+                        casted_bf16[l] = __float22bfloat162_rn(reduced[j * kNumElemsPerUint4 + l]);
+                    dst[j * 32 + lane_idx] = casted;
+                }
+            }
+        } else {
         uint32_t combine_phase = 0;
         uint32_t load_stage_idx = 0;
         for (uint32_t token_idx = sm_idx * kNumCombineWarps + combine_warp_idx;
@@ -925,6 +1250,7 @@ sm100_mega_moe_m2n_ag_impl(void* y,
                 }
             }
         }
+        }  // kSplitCombine
         if (do_timing_combine_leader) {
             const auto timing_t1 = clock64();
             m2n_detail::ag_timing_add(debug_timings, m2n_detail::AGTimingSlot::CombineReduce, timing_t1 - timing_t0);
@@ -962,6 +1288,18 @@ template <
     bool kUseFP8Weights,
     uint32_t kNumLanes,
     bool kEnableDebugTiming = false,
+    // Point-to-point protocol (see the AG kernel): release counters per AG rank
+    // instead of the union-wide tag-2/tag-3 barriers.
+    bool kP2P = false,
+    // Push dispatch (see the AG kernel): the tokens to serve are in this rank's
+    // own staging rows, so the pull is a local copy.
+    bool kPushDispatch = false,
+    // FP8 weights that keep their own 128x128 block scales: the MMA applies each
+    // scale rounded up to UE8M0, and the epilogue multiplies each K block's partial
+    // sum by the rest (`block_scale_residual_ptrs`), so the weights need no
+    // requantization to UE8M0 scales. Each K block then gets its own accumulator,
+    // handed from the MMA to the epilogue as a whole block's is otherwise.
+    bool kExactBlockScales = false,
     uint32_t kNumRanks = kNumAGRanks + kNumEGRanks,
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
@@ -1006,7 +1344,27 @@ sm100_mega_moe_m2n_eg_impl(int* cumulative_local_expert_recv_stats,
                                    // (l1_w, l1_w_sf, l2_w, l2_w_sf); consumed via tensormap fences.
                                    const cute::TmaDescriptor* __restrict__ weight_descs,
                                    const void* const* __restrict__ l1_weight_ptrs,
-                                   const uint32_t num_layers) {
+                                   // Per-layer residuals of the FP8 weights' 128x128 block scales
+                                   // over their UE8M0 rounding, [num_layers] pointers to float
+                                   // [E_local][L1 row blocks x L1 K blocks + L2 row blocks x L2 K
+                                   // blocks], row-block major. Null unless kExactBlockScales.
+                                   const float* const* __restrict__ block_scale_residual_ptrs,
+                                   const uint32_t num_layers,
+                                   // Model layer of `layer_i == 0`: the P2P counter parity
+                                   // is the model layer's, whether one launch serves one
+                                   // layer or all.
+                                   const uint32_t layer_base,
+                                   // Early start (P2P): with at most `early_max_late` source ranks
+                                   // still missing, serve the arrived ones in a first pass and the
+                                   // late ones in a second, when the policy says so (0: after
+                                   // `early_wait_cycles`; 1: adaptive, see the decision below).
+                                   // early_max_late 0 = one pass over every source, as before.
+                                   const uint32_t early_max_late,
+                                   const uint32_t early_wait_cycles,
+                                   const uint32_t early_policy,
+                                   const uint32_t early_pass_cycles,
+                                   const uint32_t early_expert_cycles,
+                                   const uint32_t early_margin_pct) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)) or defined(__CLION_IDE__)
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
     using Allocator = cute::TMEM::Allocator2Sm;
@@ -1055,7 +1413,7 @@ sm100_mega_moe_m2n_eg_impl(int* cumulative_local_expert_recv_stats,
         }
     }
 
-    // Token and buffer layouts
+    // Token and buffer layouts (must mirror the AG kernel's chain exactly)
     constexpr auto fp8_token_layout = layout::Data(kHidden);
     constexpr auto bf16_token_layout = layout::Data(kHidden * sizeof(nv_bfloat16));
     constexpr auto fp8_intermediate_token_layout = layout::Data(kIntermediateHidden);
@@ -1105,7 +1463,14 @@ sm100_mega_moe_m2n_eg_impl(int* cumulative_local_expert_recv_stats,
     DG_STATIC_ASSERT(BLOCK_N % kSwizzleCDMode == 0, "Invalid block N");
 
     // Epilogue configs
-    constexpr uint32_t kNumEpilogueStages = 2;
+    // Exact block scales sum each K block's partial product in the epilogue. An accumulator
+    // stage then holds kNumKBlocksPerAccum K blocks side by side (one hand-off for them all)
+    // and more stages are in flight, so the MMA stays ahead of the epilogue's sums; both
+    // as get_num_epilogue_stages_for_mega_moe on the host.
+    constexpr uint32_t kNumKBlocksPerAccum = not kExactBlockScales ? 1 : BLOCK_M <= 16 ? 4 : BLOCK_M <= 32 ? 2 : 1;
+    constexpr uint32_t kNumExactStages = 448 / (kNumKBlocksPerAccum * BLOCK_M);
+    constexpr uint32_t kNumEpilogueStages = not kExactBlockScales ? 2 :
+        kNumExactStages >= 8 ? 8 : kNumExactStages <= 2 ? 2 : kNumExactStages;
     constexpr uint32_t kNumTMAStoreStages = 2;
 
     // Shared memory
@@ -1134,7 +1499,8 @@ sm100_mega_moe_m2n_eg_impl(int* cumulative_local_expert_recv_stats,
                      "Shared memory of CD/A/B must be aligned to 1024 bytes");
 
     // Tensor memory size
-    constexpr uint32_t kNumAccumTmemCols = UMMA_N * kNumEpilogueStages;
+    constexpr uint32_t kAccumStageCols = UMMA_N * kNumKBlocksPerAccum;
+    constexpr uint32_t kNumAccumTmemCols = kAccumStageCols * kNumEpilogueStages;
     constexpr uint32_t kNumSFATmemCols = SF_BLOCK_M / 32;
     constexpr uint32_t kNumSFBTmemCols = SF_BLOCK_N / 32;
     constexpr uint32_t kNumTmemCols = utils::get_num_aligned_tmem_cols<kNumAccumTmemCols + kNumSFATmemCols + kNumSFBTmemCols>();
@@ -1189,7 +1555,9 @@ sm100_mega_moe_m2n_eg_impl(int* cumulative_local_expert_recv_stats,
     // Initialization
     if (warp_idx == 0) {
         if (cute::elect_one_sync())
-            ptx::st_shared_bulk(smem_expert_count, kNumExperts * sizeof(uint32_t));
+            // st.bulk stores whole 8-byte words: an odd expert count (a remote
+            // shared-expert slot per EG rank) would leave the last counter unset
+            ptx::st_shared_bulk(smem_expert_count, math::constexpr_align<uint32_t>(kNumExperts * sizeof(uint32_t), 8));
     } else if (warp_idx == 1) {
         #pragma unroll
         for (uint32_t i = lane_idx; i < kNumDispatchBarrierSlots; i += 32)
@@ -1289,6 +1657,199 @@ sm100_mega_moe_m2n_eg_impl(int* cumulative_local_expert_recv_stats,
     // Combine outputs (live on AG ranks; EG pushes through `sym_buffer.map`)
     const auto combine_token_buffer = layout::Buffer(
         bf16_token_layout, kNumTopk, kNumMaxTokensPerRank, l2_sf_buffer.get_end_ptr());
+    // Push-dispatch staging (EG ranks): [source AG rank][its token] rows
+    const auto staging_token_buffer = layout::Buffer(
+        fp8_token_layout, kNumAGRanks, kNumMaxTokensPerRank, combine_token_buffer.get_end_ptr());
+    const auto staging_sf_buffer = layout::Buffer(
+        fp8_sf_layout, kNumAGRanks, kNumMaxTokensPerRank, staging_token_buffer.get_end_ptr());
+    const auto staging_topk_weights_buffer = layout::Buffer(
+        input_topk_weights_layout, kNumAGRanks, kNumMaxTokensPerRank, staging_sf_buffer.get_end_ptr());
+    const auto p2p_ctrl = layout::P2PRegionsM2N(staging_topk_weights_buffer.get_end_ptr());
+    const uint32_t model_layer_i = layer_base + layer_i;
+    const uint32_t layer_parity = model_layer_i & 1u;
+
+    // ---- L1 weight prefetch -------------------------------------------------
+    // The head of this layer's L1 weights into L2 while the counts are still in
+    // flight: the weight stream is the largest serial component of the work
+    // phase, and the wait window has idle HBM bandwidth. No hazard (static
+    // read-only data) and no completion dependency, so it goes first, ahead of
+    // the early-start decision too.
+    if (warp_idx == 0 and lane_i == 0 and num_prefetch_bytes > 0) {
+        const void* l1_weights_prefetch_l = l1_weight_ptrs[layer_i];
+        constexpr uint32_t kPrefetchChunk = 128 * 1024;
+        const uint32_t slice = (num_prefetch_bytes / kNumSMs) & ~15u;
+        const auto slice_base = static_cast<const uint8_t*>(l1_weights_prefetch_l) +
+                                static_cast<uint64_t>(sm_idx) * slice;
+        for (uint32_t off = lane_idx * kPrefetchChunk; off < slice; off += 32 * kPrefetchChunk)
+            m2n_detail::prefetch_l2_evict_last(slice_base + off, cute::min(kPrefetchChunk, (slice - off) & ~15u));
+        __syncwarp();
+    }
+
+    // ---- early start: which sources the first pass serves -----------------
+    // One pass over every source unless early start is on (P2P only) and the
+    // round is lopsided: once all but at most `early_max_late` sources have
+    // pushed, SM 0's first dispatch warp (the leader) may start a first pass over
+    // the arrived ones and leave the late ones to a second. When, is the policy:
+    //  - fixed: when the late ones are still missing `early_wait_cycles` later;
+    //  - adaptive: right away if the late ones are expected to come no sooner
+    //    than the first pass would end, with `early_margin_pct` to spare (a first
+    //    pass that ends before they come costs the late ones nothing, and their
+    //    own pass reads only the weights of their own experts); otherwise one
+    //    pass. The leader keeps, per lane, a running average of how late the late
+    //    sources came and of a pass's time per expert it serves (plus a fixed
+    //    `early_pass_cycles`), and prices the first pass by the experts the
+    //    arrived sources route to.
+    // Sources announce themselves in this lane's arrival word; the choice goes
+    // through its decision word (compare-and-swap from 0, so it is taken once),
+    // which the first thread of every other SM also sets to one pass as soon as
+    // it sees every source in, without waiting for the leader. One thread per SM
+    // polls and the SM's warps meet at a named barrier; the idle warp keeps no
+    // barrier and never reads the word. A GEMM row does not depend on which other
+    // rows share its expert block, so the output is the same either way.
+    constexpr uint32_t kAllSources = kNumAGRanks >= 32 ? 0xffffffffu : ((1u << kNumAGRanks) - 1u);
+    constexpr uint32_t kDecisionBarrierIdx = 9;
+    // the decision word packs the source mask into 24 bits (the host checks it)
+    const bool early_start = kP2P and kNumAGRanks <= 24 and early_max_late > 0;
+    const bool early_adaptive = early_start and early_policy == 1;
+    uint32_t first_mask = kAllSources;
+    // SM 0's leader warp: when the round's first `early_max_late`-or-fewer-missing
+    // state was seen (-1: never, every source came at once)
+    long long early_t_ready = -1;
+    if (early_start and warp_idx != kNumDispatchWarps + 3) {
+        const auto decision_ptr = p2p_ctrl.get_eg_decision_ptr();
+        const auto arrival_ptr = p2p_ctrl.get_eg_arrival_ptr();
+        const uint32_t tag = 0x80000000u | ((model_layer_i & 0x7fu) << 24);
+        const auto is_this_round = [=](const uint32_t& w) { return (w & 0xff000000u) == tag; };
+        const auto guard_start = clock64();
+        if (warp_idx == 0 and sm_idx == 0) {
+            bool one_pass_only = false;  // adaptive: the late ones come too soon
+            uint32_t word = 0;
+            while (true) {
+                uint32_t w = 0, arrived = 0;
+                if (lane_idx == 0) {
+                    w = static_cast<uint32_t>(ptx::ld_acq_sys(decision_ptr));
+                    arrived = static_cast<uint32_t>(ptx::ld_acq_sys(arrival_ptr));
+                    DG_HANG_GUARD(guard_start, "DG hang guard: EG leader rank=%u layer=%u lane=%u decision=%x arrived=%x one_pass=%d\n",
+                                  sym_buffer.rank_idx, model_layer_i, lane_i, w, arrived, static_cast<int>(one_pass_only));
+                }
+                w = __shfl_sync(0xffffffff, w, 0);
+                arrived = __shfl_sync(0xffffffff, arrived, 0) & kAllSources;
+                if (is_this_round(w)) {
+                    word = w;
+                    break;
+                }
+                uint32_t want = 0;
+                if (arrived == kAllSources) {
+                    want = kAllSources;
+                } else if (arrived != 0 and not one_pass_only and
+                           static_cast<uint32_t>(__popc(kAllSources & ~arrived)) <= early_max_late) {
+                    // warp-uniform, like every value the branches below depend on
+                    const long long now = __shfl_sync(0xffffffff, static_cast<long long>(clock64()), 0);
+                    if (early_t_ready < 0) {
+                        early_t_ready = now;
+                        if (early_adaptive) {
+                            // experts the arrived sources route to (their count slots
+                            // trail the arrival bit by a little: wait for each)
+                            uint32_t num_experts = 0;
+                            for (uint32_t e = lane_idx; e < kNumExpertsPerRank; e += 32) {
+                                uint32_t num_tokens = 0;
+                                for (uint32_t mask = arrived; mask != 0; mask &= mask - 1) {
+                                    const auto slot_ptr = workspace.get_expert_recv_count_ptr(__ffs(mask) - 1, e);
+                                    uint64_t slot;
+                                    do {
+                                        slot = ptx::ld_volatile(slot_ptr);
+                                        DG_HANG_GUARD(guard_start, "DG hang guard: EG leader slot rank=%u layer=%u lane=%u src=%u expert=%u\n",
+                                                      sym_buffer.rank_idx, model_layer_i, lane_i, __ffs(mask) - 1, e);
+                                    } while ((slot >> 32) == 0);
+                                    num_tokens += static_cast<uint32_t>(slot);
+                                }
+                                num_experts += num_tokens > 0;
+                            }
+                            num_experts = __reduce_add_sync(0xffffffff, num_experts);
+                            int expert_cycles = 0, late_cycles = 0;
+                            if (lane_idx == 0) {
+                                expert_cycles = ptx::ld_acq_sys(p2p_ctrl.get_eg_expert_ns_ptr());
+                                late_cycles = ptx::ld_acq_sys(p2p_ctrl.get_eg_late_ns_ptr());
+                            }
+                            expert_cycles = __shfl_sync(0xffffffff, expert_cycles, 0);
+                            if (expert_cycles <= 0)
+                                expert_cycles = static_cast<int>(early_expert_cycles);
+                            const long long first_pass = static_cast<long long>(early_pass_cycles) +
+                                                         static_cast<long long>(num_experts) * expert_cycles;
+                            const long long late = __shfl_sync(0xffffffff, late_cycles, 0);
+                            if (late * 100 >= first_pass * (100 + static_cast<long long>(early_margin_pct)))
+                                want = arrived;
+                            else
+                                one_pass_only = true;
+                        }
+                    }
+                    if (not early_adaptive and now - early_t_ready >= static_cast<long long>(early_wait_cycles))
+                        want = arrived;
+                }
+                if (want != 0) {
+                    uint32_t prev = 0;
+                    if (lane_idx == 0)
+                        prev = static_cast<uint32_t>(atomicCAS(decision_ptr, 0, static_cast<int>(tag | want)));
+                    prev = __shfl_sync(0xffffffff, prev, 0);
+                    w = prev == 0 ? (tag | want) : prev;
+                    if (is_this_round(w)) {
+                        word = w;
+                        break;
+                    }
+                }
+            }
+            const bool split = (word & kAllSources) != kAllSources;
+            if (lane_idx == 0) {
+                if (split)
+                    atomicAdd(p2p_ctrl.get_eg_split_count_ptr(), 1);
+                // one pass: how late the last sources were is known now (0 if they
+                // all came at once); a split round learns it in its second pass
+                if (early_adaptive and not split) {
+                    const long long late = early_t_ready < 0 ? 0 : clock64() - early_t_ready;
+                    const auto late_ptr = p2p_ctrl.get_eg_late_ns_ptr();
+                    const long long old = ptx::ld_acq_sys(late_ptr);
+                    atomicExch(late_ptr, static_cast<int>(cute::min(old + (late - old) / 4, 0x7fffffffll)));
+                }
+            }
+            __syncwarp();
+        } else if (warp_idx == 0 and lane_idx == 0) {
+            // other SMs: wait for the decision, or take one pass once every source is in
+            while (true) {
+                const auto w = static_cast<uint32_t>(ptx::ld_acq_sys(decision_ptr));
+                DG_HANG_GUARD(guard_start, "DG hang guard: EG sm=%u rank=%u layer=%u lane=%u decision=%x arrived=%x\n",
+                              sm_idx, sym_buffer.rank_idx, model_layer_i, lane_i, w,
+                              static_cast<uint32_t>(ptx::ld_acq_sys(arrival_ptr)));
+                if (is_this_round(w))
+                    break;
+                if ((static_cast<uint32_t>(ptx::ld_acq_sys(arrival_ptr)) & kAllSources) == kAllSources) {
+                    const auto prev = static_cast<uint32_t>(
+                        atomicCAS(decision_ptr, 0, static_cast<int>(tag | kAllSources)));
+                    if (prev == 0 or is_this_round(prev))
+                        break;
+                }
+            }
+        }
+        if (warp_idx == 0)
+            __syncwarp();
+        // every warp but the idle one: the SM's decision is in
+        ptx::sync_aligned(kNumThreads - 32, kDecisionBarrierIdx);
+        uint32_t word = 0;
+        if (lane_idx == 0)
+            word = static_cast<uint32_t>(ptx::ld_acq_sys(decision_ptr));
+        word = __shfl_sync(0xffffffff, word, 0);
+        DG_TRAP_ONLY_DEVICE_ASSERT(is_this_round(word));
+        first_mask = word & kAllSources;
+    }
+
+    // ---- passes over the sources (one unless early start split the round) --
+    for (uint32_t pass = 0; pass < 2; ++ pass) {
+    const uint32_t pass_mask = pass == 0 ? first_mask : (kAllSources & ~first_mask);
+    if (pass_mask == 0)
+        break;
+    const bool last_pass = pass == 1 or first_mask == kAllSources;
+    // 0 keeps the counts on the per-expert sums: the old single pass, unchanged
+    // (also an early-start round served in one pass: every source is in)
+    const uint32_t sched_src_mask = first_mask != kAllSources ? pass_mask : 0;
 
     // Task scheduler: experts of this EG rank; sources are the AG ranks
     auto scheduler = sched::MegaMoEScheduler<
@@ -1300,6 +1861,8 @@ sm100_mega_moe_m2n_eg_impl(int* cumulative_local_expert_recv_stats,
         kNumSMs, kNumAGRanks,
         /* kRecvCountHighTarget = */ kNumAGRanks,
         layout::WorkspaceM2N>(workspace);
+    scheduler.src_mask = sched_src_mask;
+    scheduler.dbg_tag = (sym_buffer.rank_idx << 24) | ((model_layer_i & 0xffffu) << 8) | (lane_i << 1) | pass;
 
     // Intra-SM Barrier indices
     constexpr uint32_t kDispatchBarrierIdx = 0;
@@ -1317,7 +1880,7 @@ sm100_mega_moe_m2n_eg_impl(int* cumulative_local_expert_recv_stats,
     const bool do_timing_leader = kEnableDebugTiming and sm_idx == 0 and lane_idx == 0;
     const bool do_timing_dispatch_leader = do_timing_leader and warp_idx == 0;
     if (do_timing_dispatch_leader)
-        eg_timing_store<kNumLanes>(debug_timings, layer_i, lane_i, EGTimingSlot::LaneStart, clock64());
+        eg_timing_store<kNumLanes * 2>(debug_timings, layer_i, lane_i * 2 + pass, EGTimingSlot::LaneStart, clock64());
 
     // Adjust registers
     constexpr uint32_t kNumDispatchRegisters = 48;
@@ -1333,34 +1896,23 @@ sm100_mega_moe_m2n_eg_impl(int* cumulative_local_expert_recv_stats,
         // Adjust registers
         cutlass::arch::warpgroup_reg_dealloc<kNumDispatchRegisters>();
 
-        // Prefetch the head of the L1 weights into L2 while the recv counts
-        // are still in flight: the weight stream is the largest serial
-        // component of the work phase, and the wait window has idle HBM
-        // bandwidth.  No hazard (static read-only data) and no completion
-        // dependency, so it goes before the deferred barrier wait.
-        if (lane_i == 0 and warp_idx == 0 and num_prefetch_bytes > 0) {
-            const void* l1_weights_prefetch_l = l1_weight_ptrs[layer_i];
-            constexpr uint32_t kPrefetchChunk = 128 * 1024;
-            const uint32_t slice = (num_prefetch_bytes / kNumSMs) & ~15u;
-            const auto slice_base = static_cast<const uint8_t*>(l1_weights_prefetch_l) +
-                                    static_cast<uint64_t>(sm_idx) * slice;
-            for (uint32_t off = lane_idx * kPrefetchChunk; off < slice; off += 32 * kPrefetchChunk)
-                prefetch_l2_evict_last(slice_base + off, cute::min(kPrefetchChunk, (slice - off) & ~15u));
-            __syncwarp();
-        }
-
         // Deferred tag-3 wait from the previous layer (signals were sent at
         // the previous kernel's end; this consumes the phase nearly for
         // free).  Pulls themselves are gated by the per-expert recv-count
         // spins, so no pre-pull barrier is needed.
         unsigned long long t0 = do_timing_dispatch_leader ? clock64() : 0;
+        // P2P: nothing to wait for. This lane's previous cleanup finished on
+        // every SM before the grid sync that sent its credits, which this SM
+        // passed; the next counts arrive only after those credits.
+        if constexpr (not kP2P) {
         comm::nvlink_barrier_wait<kNumRanks, kNumSMs, kNumDispatchThreads,
                                   kDispatchGridSyncIndex, kAfterWorkspaceCleanBarrierTag>(
             workspace, sym_buffer, sm_idx, thread_idx,
             [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); }
         );
+        }
         if (do_timing_dispatch_leader)
-            eg_timing_add<kNumLanes>(debug_timings, layer_i, lane_i, EGTimingSlot::Tag3Wait, clock64() - t0);
+            eg_timing_add<kNumLanes * 2>(debug_timings, layer_i, lane_i * 2 + pass, EGTimingSlot::Tag3Wait, clock64() - t0);
         // Release the free-running GEMM warps (TMA-A/TMA-B/MMA) for this
         // iteration: the deferred wait above globally orders the previous
         // iteration's workspace cleanup, so their count fetches can no
@@ -1368,7 +1920,7 @@ sm100_mega_moe_m2n_eg_impl(int* cumulative_local_expert_recv_stats,
         t0 = do_timing_dispatch_leader ? clock64() : 0;
         ptx::sync_unaligned(kNumSchedFetchThreads, kSchedFetchBarrierIdx);
         if (do_timing_dispatch_leader)
-            eg_timing_add<kNumLanes>(debug_timings, layer_i, lane_i, EGTimingSlot::SchedFetchBarrierDispatch, clock64() - t0);
+            eg_timing_add<kNumLanes * 2>(debug_timings, layer_i, lane_i * 2 + pass, EGTimingSlot::SchedFetchBarrierDispatch, clock64() - t0);
 
         // Ensure the epilogue barrier cannot run with the pull barrier
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
@@ -1381,11 +1933,29 @@ sm100_mega_moe_m2n_eg_impl(int* cumulative_local_expert_recv_stats,
         // the spin is volatile, so add an acquire fence before reading the
         // remotely-written src indices / token data it gates.
         t0 = do_timing_dispatch_leader ? clock64() : 0;
+        const bool early_learner = early_adaptive and sm_idx == 0 and warp_idx == 0;
+        const long long early_fetch_t0 = early_learner ? clock64() : 0;
         scheduler.fetch_expert_recv_count();
+        // Adaptive early start (the leader warp): a second pass learns how late its
+        // sources came (exactly if it had to wait for them; otherwise no later than
+        // now, which may only lower the average), and every pass is timed from its
+        // counts to its credits for the per-expert cost
+        long long early_pass_t0 = 0;
+        if (early_learner) {
+            early_pass_t0 = clock64();
+            if (pass == 1 and lane_idx == 0 and early_t_ready >= 0) {
+                constexpr long long kWaitedCycles = 2000;
+                const auto late_ptr = p2p_ctrl.get_eg_late_ns_ptr();
+                const long long old = ptx::ld_acq_sys(late_ptr);
+                const long long late = early_pass_t0 - early_t_ready;
+                if (early_pass_t0 - early_fetch_t0 > kWaitedCycles or late < old)
+                    atomicExch(late_ptr, static_cast<int>(cute::min(old + (late - old) / 4, 0x7fffffffll)));
+            }
+        }
         if (do_timing_dispatch_leader)
-            eg_timing_add<kNumLanes>(debug_timings, layer_i, lane_i, EGTimingSlot::RecvCountWaitDispatch, clock64() - t0);
+            eg_timing_add<kNumLanes * 2>(debug_timings, layer_i, lane_i * 2 + pass, EGTimingSlot::RecvCountWaitDispatch, clock64() - t0);
         if (do_timing_dispatch_leader)
-            eg_timing_store<kNumLanes>(debug_timings, layer_i, lane_i, EGTimingSlot::RecvCountReadyTime, clock64());
+            eg_timing_store<kNumLanes * 2>(debug_timings, layer_i, lane_i * 2 + pass, EGTimingSlot::RecvCountReadyTime, clock64());
         if constexpr (kEnableDebugTiming) {
             constexpr uint32_t kNumExpertsPerTimingLane =
                 math::constexpr_ceil_div(kNumExpertsPerRank, 32u);
@@ -1411,16 +1981,16 @@ sm100_mega_moe_m2n_eg_impl(int* cumulative_local_expert_recv_stats,
                 max_tokens = max_tokens > other ? max_tokens : other;
             }
             if (do_timing_dispatch_leader) {
-                eg_timing_store<kNumLanes>(
-                    debug_timings, layer_i, lane_i,
+                eg_timing_store<kNumLanes * 2>(
+                    debug_timings, layer_i, lane_i * 2 + pass,
                     EGTimingSlot::TotalRecvTokens,
                     static_cast<unsigned long long>(total_tokens));
-                eg_timing_store<kNumLanes>(
-                    debug_timings, layer_i, lane_i,
+                eg_timing_store<kNumLanes * 2>(
+                    debug_timings, layer_i, lane_i * 2 + pass,
                     EGTimingSlot::MaxExpertTokens,
                     static_cast<unsigned long long>(max_tokens));
-                eg_timing_store<kNumLanes>(
-                    debug_timings, layer_i, lane_i,
+                eg_timing_store<kNumLanes * 2>(
+                    debug_timings, layer_i, lane_i * 2 + pass,
                     EGTimingSlot::TotalMBlocks,
                     static_cast<unsigned long long>(total_m_blocks));
             }
@@ -1464,15 +2034,45 @@ sm100_mega_moe_m2n_eg_impl(int* cumulative_local_expert_recv_stats,
                 expert_end_idx += scheduler.get_num_tokens(current_expert_idx);
             }
 
-            // Load per-source-rank counts when expert changes
+            // Load per-source-rank counts when expert changes, and do not use them
+            // until they add up to the expert total the scheduler spun on. The AG pushes
+            // each per-source count with a plain remote store and only then bumps the
+            // total with a relaxed system-scope atomic (count push in
+            // `sm100_mega_moe_m2n_ag_impl`); nothing orders the two across NVLink, so the
+            // total can land first. A short set made the min-peeling below spin forever
+            // once every source was exhausted (zero actives, length 0xffffffff): the EG
+            // rank never reached the tag-2 barrier and printed nothing while every other
+            // rank timed out there, and a warp that loaded a short set without reaching
+            // the spin assigned sources inconsistently with its peers. Volatile loads so
+            // a retry re-reads the remote word. Bounded like the NVLink barrier, but
+            // shorter so this side traps first; no printf, which spills this warp role.
+            // An early-start pass serves only its own sources, whose counts make the
+            // total the scheduler read for it; the other sources count zero here.
             if (old_expert_idx != current_expert_idx) {
                 old_expert_idx = current_expert_idx;
-                #pragma unroll
-                for (uint32_t i = 0; i < kNumRanksPerLane; ++ i) {
-                    const uint32_t j = i * 32 + lane_idx;
-                    stored_rank_count[i] = j < kNumAGRanks ?
-                        static_cast<uint32_t>(*workspace.get_expert_recv_count_ptr(j, current_expert_idx)) : 0;
+                const uint32_t expert_total = expert_end_idx - expert_start_idx;
+                const auto start_clock = clock64();
+                bool retried = false;
+                while (true) {
+                    uint32_t sum_in_lane = 0;
+                    #pragma unroll
+                    for (uint32_t i = 0; i < kNumRanksPerLane; ++ i) {
+                        const uint32_t j = i * 32 + lane_idx;
+                        const bool in_pass = j < kNumAGRanks and
+                                             (sched_src_mask == 0 or ((sched_src_mask >> j) & 1u));
+                        stored_rank_count[i] = in_pass ?
+                            static_cast<uint32_t>(ptx::ld_volatile(workspace.get_expert_recv_count_ptr(j, current_expert_idx))) : 0;
+                        sum_in_lane += stored_rank_count[i];
+                    }
+                    if (__reduce_add_sync(0xffffffff, sum_in_lane) == expert_total)
+                        break;
+                    retried = true;
+                    if (clock64() - start_clock >= 30ll * 2000000000ll)
+                        asm volatile("trap;");
                 }
+                // Order the source-index reads after counts that arrived late
+                if (retried)
+                    fence_acquire_sys();
             }
 
             // Round-robin source rank selection via iterative min-peeling
@@ -1521,9 +2121,21 @@ sm100_mega_moe_m2n_eg_impl(int* cumulative_local_expert_recv_stats,
                     remaining[i] -= cute::min(remaining[i], length);
             }
 
-            // Read source token-topk index (written by the AG dispatch via NVLink)
-            const uint32_t src_token_topk_idx = *workspace.get_src_token_topk_idx_ptr(
+            // Read source token-topk index (written by the AG dispatch via NVLink, as the
+            // index + 1). Nothing orders that store before the count push (P2P has no
+            // barrier before the pull), so wait for it, then clear the slot for the
+            // round after (the credits, released after this round's cleanup, order the
+            // clear before the next store).
+            const auto src_idx_ptr = workspace.get_src_token_topk_idx_ptr(
                 current_expert_idx, current_rank_in_expert_idx, token_idx_in_rank);
+            uint32_t src_idx_plus_1 = 0;
+            const auto idx_start_clock = clock64();
+            while ((src_idx_plus_1 = ptx::ld_volatile(src_idx_ptr)) == 0)
+                DG_HANG_GUARD(idx_start_clock, "DG hang guard: EG index slot rank=%u layer=%u lane=%u src=%u expert=%d slot=%u\n",
+                              sym_buffer.rank_idx, model_layer_i, lane_i, current_rank_in_expert_idx, current_expert_idx,
+                              token_idx_in_rank);
+            *src_idx_ptr = 0;
+            const uint32_t src_token_topk_idx = src_idx_plus_1 - 1;
             const uint32_t src_token_idx = src_token_topk_idx / kNumTopk;
             const uint32_t src_topk_idx = src_token_topk_idx % kNumTopk;
 
@@ -1544,12 +2156,15 @@ sm100_mega_moe_m2n_eg_impl(int* cumulative_local_expert_recv_stats,
             const auto pull_mbarrier = dispatch_barriers[warp_idx * kNumDispatchPullStages + pull_stage_idx];
 
             if (record.valid and cute::elect_one_sync()) {
-                ptx::tma_load_1d(
-                    pull_buffer.get_base_ptr(),
-                    sym_buffer.map(input_token_buffer.get_data_buffer(record.src_token_idx).get_base_ptr(),
-                                   record.rank_idx),
-                    pull_mbarrier, kHidden);
-                ptx::mbarrier_arrive_and_set_tx(pull_mbarrier, kHidden);
+                constexpr uint32_t kTokenBytes = kHidden;
+                // push dispatch: the source rank already wrote the row here
+                const void* src_row = kPushDispatch
+                    ? staging_token_buffer.get_rank_buffer(record.rank_idx)
+                      .get_data_buffer(record.src_token_idx).get_base_ptr()
+                    : sym_buffer.map(input_token_buffer.get_data_buffer(record.src_token_idx).get_base_ptr(),
+                                     record.rank_idx);
+                ptx::tma_load_1d(pull_buffer.get_base_ptr(), src_row, pull_mbarrier, kTokenBytes);
+                ptx::mbarrier_arrive_and_set_tx(pull_mbarrier, kTokenBytes);
             }
             __syncwarp();
         };
@@ -1558,12 +2173,25 @@ sm100_mega_moe_m2n_eg_impl(int* cumulative_local_expert_recv_stats,
             const auto pull_buffer = smem_send_buffers.get_rank_buffer(warp_idx).get_data_buffer(pull_stage_idx);
             const auto pull_mbarrier = dispatch_barriers[warp_idx * kNumDispatchPullStages + pull_stage_idx];
 
-            // Load and store SF (overlaps with TMA token load)
-            constexpr uint32_t kNumSFUint32 = kHidden / 128;
+            // Load and store SF (overlaps with TMA token load), and the routing
+            // weight with it: one remote round trip for both
+            constexpr uint32_t kNumSFUint32 = kHidden / (kGranK * 4);
             DG_STATIC_ASSERT(kNumSFUint32 > 0 and kHidden % 128 == 0, "Invalid SF");
-            const auto remote_sf_ptr = sym_buffer.map(
-                input_sf_buffer.get_data_buffer(record.src_token_idx).get_base_ptr<uint32_t>(),
-                record.rank_idx);
+            float weight = 0;
+            if (lane_idx == 0) {
+                weight = kPushDispatch
+                    ? staging_topk_weights_buffer.get_rank_buffer(record.rank_idx)
+                      .get_data_buffer(record.src_token_idx).get_base_ptr<float>()[record.src_topk_idx]
+                    : *sym_buffer.map(
+                        input_topk_weights_buffer.get_base_ptr<float>() + record.src_token_topk_idx,
+                        record.rank_idx);
+            }
+            const auto remote_sf_ptr = kPushDispatch
+                ? staging_sf_buffer.get_rank_buffer(record.rank_idx)
+                  .get_data_buffer(record.src_token_idx).get_base_ptr<uint32_t>()
+                : sym_buffer.map(
+                    input_sf_buffer.get_data_buffer(record.src_token_idx).get_base_ptr<uint32_t>(),
+                    record.rank_idx);
             const auto local_sf_ptr = l1_sf_buffer.get_base_ptr<uint32_t>();
             #pragma unroll
             for (uint32_t i = 0; i < math::constexpr_ceil_div(kNumSFUint32, 32u); ++ i) {
@@ -1571,13 +2199,12 @@ sm100_mega_moe_m2n_eg_impl(int* cumulative_local_expert_recv_stats,
                 if (j < kNumSFUint32)
                     local_sf_ptr[j * kNumPaddedSFPoolTokens + record.sf_pool_token_idx] = remote_sf_ptr[j];
             }
+            weight = __shfl_sync(0xffffffff, weight, 0);
+            // the SF stores of every lane come before the arrival release below
             __syncwarp();
 
             // Store weights and token data
             if (cute::elect_one_sync()) {
-                const auto weight = *sym_buffer.map(
-                    input_topk_weights_buffer.get_base_ptr<float>() + record.src_token_topk_idx,
-                    record.rank_idx);
                 *l1_topk_weights_buffer.get_data_buffer(record.pool_token_idx).get_base_ptr<float>() = weight;
 
                 ptx::mbarrier_wait_and_flip_phase(pull_mbarrier, pull_mbarrier_phase[pull_stage_idx]);
@@ -1626,21 +2253,24 @@ sm100_mega_moe_m2n_eg_impl(int* cumulative_local_expert_recv_stats,
             }
         }
         if (do_timing_dispatch_leader)
-            eg_timing_add<kNumLanes>(debug_timings, layer_i, lane_i, EGTimingSlot::PullLoopDispatch, clock64() - t0);
+            eg_timing_add<kNumLanes * 2>(debug_timings, layer_i, lane_i * 2 + pass, EGTimingSlot::PullLoopDispatch, clock64() - t0);
         if (do_timing_dispatch_leader)
-            eg_timing_store<kNumLanes>(debug_timings, layer_i, lane_i, EGTimingSlot::PullDoneTime, clock64());
+            eg_timing_store<kNumLanes * 2>(debug_timings, layer_i, lane_i * 2 + pass, EGTimingSlot::PullDoneTime, clock64());
 
         // Clean workspace for the next usage, and also do cumulative stats
         t0 = do_timing_dispatch_leader ? clock64() : 0;
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
         if (do_timing_dispatch_leader)
-            eg_timing_add<kNumLanes>(debug_timings, layer_i, lane_i, EGTimingSlot::DispatchEpilogueSync, clock64() - t0);
+            eg_timing_add<kNumLanes * 2>(debug_timings, layer_i, lane_i * 2 + pass, EGTimingSlot::DispatchEpilogueSync, clock64() - t0);
 
         DG_STATIC_ASSERT(kNumSMs > 1, "Invalid SM count");
         if (sm_idx != 0) {
             for (uint32_t i = sm_idx - 1; i < kNumExpertsPerRank; i += kNumSMs - 1) {
-                const auto num_recv_tokens = static_cast<uint32_t>(
-                    *workspace.get_expert_recv_count_sum_ptr(i));
+                // A pass's own tokens: the sum also holds a late source's push
+                // (early start), and is only cleared after the last pass.
+                const auto num_recv_tokens = sched_src_mask != 0 ?
+                    scheduler.get_num_tokens(i) :
+                    static_cast<uint32_t>(*workspace.get_expert_recv_count_sum_ptr(i));
                 const auto num_recv_m_blocks = math::ceil_div(num_recv_tokens, BLOCK_M);
 
                 expert_pool_block_offset = scheduler.get_pool_block_offset(i);
@@ -1649,16 +2279,20 @@ sm100_mega_moe_m2n_eg_impl(int* cumulative_local_expert_recv_stats,
 
                 DG_STATIC_ASSERT(kNumDispatchWarps >= 2, "Not enough dispatch warps");
                 if (warp_idx == 0) {
-                    *workspace.get_expert_recv_count_sum_ptr(i) = 0;
+                    if (last_pass)
+                        *workspace.get_expert_recv_count_sum_ptr(i) = 0;
                 } else if (warp_idx == 1) {
                     if (cute::elect_one_sync() and cumulative_local_expert_recv_stats != nullptr)
                         ptx::red_add(cumulative_local_expert_recv_stats + i, static_cast<int>(num_recv_tokens));
                     __syncwarp();
                 }
 
-                // Clean per-source-rank token count
-                for (uint32_t j = thread_idx; j < kNumAGRanks; j += kNumDispatchThreads)
-                    *workspace.get_expert_recv_count_ptr(j, i) = 0;
+                // Clean per-source-rank token count, of this pass's sources only:
+                // a late source may already have pushed for the next pass
+                for (uint32_t j = thread_idx; j < kNumAGRanks; j += kNumDispatchThreads) {
+                    if (sched_src_mask == 0 or ((sched_src_mask >> j) & 1u))
+                        *workspace.get_expert_recv_count_ptr(j, i) = 0;
+                }
                 __syncwarp();
 
                 // Clean L1 and L2 arrival stuffs
@@ -1674,21 +2308,65 @@ sm100_mega_moe_m2n_eg_impl(int* cumulative_local_expert_recv_stats,
         // deferred into the next kernel launch, where the inter-layer gap
         // has already hidden the cross-rank latency.
         t0 = do_timing_dispatch_leader ? clock64() : 0;
+        if constexpr (kP2P) {
+            // Credits to every AG rank once all SMs cleaned the workspace (after
+            // the last pass: the first pass leaves the late sources' slots set)
+            comm::grid_sync<kNumSMs, kDispatchGridSyncIndex>(
+                workspace, sm_idx, thread_idx,
+                [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); });
+            if (early_learner) {
+                // this pass's time per expert it served, past the fixed part
+                uint32_t num_experts = 0;
+                #pragma unroll
+                for (uint32_t i = 0; i < math::constexpr_ceil_div(kNumExpertsPerRank, 32u); ++ i)
+                    num_experts += scheduler.stored_num_tokens_per_expert[i] > 0;
+                num_experts = __reduce_add_sync(0xffffffff, num_experts);
+                if (lane_idx == 0 and num_experts > 0) {
+                    const long long per_expert = cute::max(
+                        clock64() - early_pass_t0 - static_cast<long long>(early_pass_cycles), 0ll) / num_experts;
+                    const auto expert_ptr = p2p_ctrl.get_eg_expert_ns_ptr();
+                    long long old = ptx::ld_acq_sys(expert_ptr);
+                    if (old <= 0)
+                        old = early_expert_cycles;
+                    atomicExch(expert_ptr, static_cast<int>(old + (per_expert - old) / 8));
+                }
+                __syncwarp();
+            }
+            if (last_pass) {
+                // Every warp of every SM read the decision before its dispatch
+                // warps passed this pass's barriers, which the grid sync orders
+                // before here; clear it and the arrival bits for this buffer's next
+                // round, ahead of the credits after which the sources set them again
+                // (one thread clears, then the warp sends: early start has at most
+                // 24 sources, all in warp 0)
+                if (early_start and sm_idx == 0 and warp_idx == 0) {
+                    if (lane_idx == 0) {
+                        atomicExch(p2p_ctrl.get_eg_decision_ptr(), 0);
+                        atomicExch(p2p_ctrl.get_eg_arrival_ptr(), 0);
+                        __threadfence_system();
+                    }
+                    __syncwarp();
+                }
+                if (sm_idx == 0 and thread_idx < kNumAGRanks)
+                    ptx::red_add_rel_sys(sym_buffer.map(p2p_ctrl.get_credit_ptr(), thread_idx), 1);
+            }
+        } else {
         comm::nvlink_barrier_arrive<kNumRanks, kNumSMs, kNumDispatchThreads,
                                     kDispatchGridSyncIndex, kAfterWorkspaceCleanBarrierTag>(
             workspace, sym_buffer, sm_idx, thread_idx,
             [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); },
             true
         );
+        }
         if (do_timing_dispatch_leader)
-            eg_timing_add<kNumLanes>(debug_timings, layer_i, lane_i, EGTimingSlot::CleanupArrive, clock64() - t0);
+            eg_timing_add<kNumLanes * 2>(debug_timings, layer_i, lane_i * 2 + pass, EGTimingSlot::CleanupArrive, clock64() - t0);
     } else if (warp_idx == kNumDispatchWarps) {
         // Wait until dispatch warps have reached the scheduler-fetch point.
         const bool do_timing_tmaa_leader = do_timing_leader and warp_idx == kNumDispatchWarps;
         unsigned long long t0 = do_timing_tmaa_leader ? clock64() : 0;
         ptx::sync_unaligned(kNumSchedFetchThreads, kSchedFetchBarrierIdx);
         if (do_timing_tmaa_leader)
-            eg_timing_add<kNumLanes>(debug_timings, layer_i, lane_i, EGTimingSlot::SchedFetchBarrierTmaA, clock64() - t0);
+            eg_timing_add<kNumLanes * 2>(debug_timings, layer_i, lane_i * 2 + pass, EGTimingSlot::SchedFetchBarrierTmaA, clock64() - t0);
 
         // Adjust registers
         cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
@@ -1696,11 +2374,14 @@ sm100_mega_moe_m2n_eg_impl(int* cumulative_local_expert_recv_stats,
         // GEMM TMA load warp for tokens with SFA
         unsigned long long loop_t0 = do_timing_tmaa_leader ? clock64() : 0;
         if (do_timing_tmaa_leader)
-            eg_timing_store<kNumLanes>(debug_timings, layer_i, lane_i, EGTimingSlot::TmaAStartTime, loop_t0);
+            eg_timing_store<kNumLanes * 2>(debug_timings, layer_i, lane_i * 2 + pass, EGTimingSlot::TmaAStartTime, loop_t0);
         scheduler.for_each_block([&](const sched::BlockPhase& block_phase,
                                      const uint32_t& local_expert_idx,
                                      const uint32_t& num_k_blocks,
                                      const uint32_t& m_block_idx, const uint32_t& n_block_idx) {
+            // One lambda per block, as in the kernel the reference runs used: inlining
+            // the body instead changes the register allocation of the whole kernel.
+            const auto issue_block = [&]() {
             const auto tensor_map_a_ptr = block_phase == sched::BlockPhase::Linear2
                 ? &tensor_map_l2_acts : &tensor_map_l1_acts;
             const auto tensor_map_sfa_ptr = block_phase == sched::BlockPhase::Linear2
@@ -1715,7 +2396,7 @@ sm100_mega_moe_m2n_eg_impl(int* cumulative_local_expert_recv_stats,
                 unsigned long long wait_t0 = (kEnableDebugTiming and lane_idx == 0) ? clock64() : 0;
                 while (ptx::ld_acq(ptr) != expected);
                 if (kEnableDebugTiming and lane_idx == 0)
-                    eg_timing_add<kNumLanes>(debug_timings, layer_i, lane_i, EGTimingSlot::L1ArrivalWait, clock64() - wait_t0);
+                    eg_timing_add<kNumLanes * 2>(debug_timings, layer_i, lane_i * 2 + pass, EGTimingSlot::L1ArrivalWait, clock64() - wait_t0);
             } else {
                 DG_STATIC_ASSERT(BLOCK_K == BLOCK_N, "Invalid block sizes");
                 const auto ptr = workspace.get_l2_arrival_mask_ptr(pool_block_idx);
@@ -1723,7 +2404,7 @@ sm100_mega_moe_m2n_eg_impl(int* cumulative_local_expert_recv_stats,
                 unsigned long long wait_t0 = (kEnableDebugTiming and lane_idx == 0) ? clock64() : 0;
                 while (ptx::ld_acq_gpu(ptr) != expected);
                 if (kEnableDebugTiming and lane_idx == 0)
-                    eg_timing_add<kNumLanes>(debug_timings, layer_i, lane_i, EGTimingSlot::L2ArrivalWait, clock64() - wait_t0);
+                    eg_timing_add<kNumLanes * 2>(debug_timings, layer_i, lane_i * 2 + pass, EGTimingSlot::L2ArrivalWait, clock64() - wait_t0);
             }
 
             for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
@@ -1750,11 +2431,13 @@ sm100_mega_moe_m2n_eg_impl(int* cumulative_local_expert_recv_stats,
                 }
                 __syncwarp();
             }
+            };
+            issue_block();
         });
         if (do_timing_tmaa_leader)
-            eg_timing_add<kNumLanes>(debug_timings, layer_i, lane_i, EGTimingSlot::TmaALoop, clock64() - loop_t0);
+            eg_timing_add<kNumLanes * 2>(debug_timings, layer_i, lane_i * 2 + pass, EGTimingSlot::TmaALoop, clock64() - loop_t0);
         if (do_timing_tmaa_leader)
-            eg_timing_store<kNumLanes>(debug_timings, layer_i, lane_i, EGTimingSlot::TmaAEndTime, clock64());
+            eg_timing_store<kNumLanes * 2>(debug_timings, layer_i, lane_i * 2 + pass, EGTimingSlot::TmaAEndTime, clock64());
     } else if (warp_idx == kNumDispatchWarps + 1) {
         // Wait until dispatch warps have reached the scheduler-fetch point.
         ptx::sync_unaligned(kNumSchedFetchThreads, kSchedFetchBarrierIdx);
@@ -1775,11 +2458,14 @@ sm100_mega_moe_m2n_eg_impl(int* cumulative_local_expert_recv_stats,
         // GEMM TMA load warp for weights with SF
         unsigned long long loop_t0 = do_timing_tmab_leader ? clock64() : 0;
         if (do_timing_tmab_leader)
-            eg_timing_store<kNumLanes>(debug_timings, layer_i, lane_i, EGTimingSlot::TmaBStartTime, loop_t0);
+            eg_timing_store<kNumLanes * 2>(debug_timings, layer_i, lane_i * 2 + pass, EGTimingSlot::TmaBStartTime, loop_t0);
         scheduler.for_each_block([&](const sched::BlockPhase& block_phase,
                                      const uint32_t& local_expert_idx,
                                      const uint32_t& num_k_blocks,
                                      const uint32_t& m_block_idx, const uint32_t& n_block_idx) {
+            // One lambda per block, as in the kernel the reference runs used: inlining
+            // the body instead changes the register allocation of the whole kernel.
+            const auto issue_block = [&]() {
             const auto tensor_map_b_ptr =
                 block_phase == sched::BlockPhase::Linear2 ? tensor_map_l2_weights : tensor_map_l1_weights;
             const auto tensor_map_sfb_ptr =
@@ -1815,11 +2501,13 @@ sm100_mega_moe_m2n_eg_impl(int* cumulative_local_expert_recv_stats,
                 }
                 __syncwarp();
             }
+            };
+            issue_block();
         });
         if (do_timing_tmab_leader)
-            eg_timing_add<kNumLanes>(debug_timings, layer_i, lane_i, EGTimingSlot::TmaBLoop, clock64() - loop_t0);
+            eg_timing_add<kNumLanes * 2>(debug_timings, layer_i, lane_i * 2 + pass, EGTimingSlot::TmaBLoop, clock64() - loop_t0);
         if (do_timing_tmab_leader)
-            eg_timing_store<kNumLanes>(debug_timings, layer_i, lane_i, EGTimingSlot::TmaBEndTime, clock64());
+            eg_timing_store<kNumLanes * 2>(debug_timings, layer_i, lane_i * 2 + pass, EGTimingSlot::TmaBEndTime, clock64());
     } else if (warp_idx == kNumDispatchWarps + 2) {
         // Wait until dispatch warps have reached the scheduler-fetch point.
         ptx::sync_unaligned(kNumSchedFetchThreads, kSchedFetchBarrierIdx);
@@ -1831,7 +2519,7 @@ sm100_mega_moe_m2n_eg_impl(int* cumulative_local_expert_recv_stats,
         // GEMM MMA issue warp (only the leader CTA will run)
         unsigned long long loop_t0 = do_timing_mma_leader ? clock64() : 0;
         if (do_timing_mma_leader)
-            eg_timing_store<kNumLanes>(debug_timings, layer_i, lane_i, EGTimingSlot::MmaStartTime, loop_t0);
+            eg_timing_store<kNumLanes * 2>(debug_timings, layer_i, lane_i * 2 + pass, EGTimingSlot::MmaStartTime, loop_t0);
         if (is_leader_cta) {
             auto instr_desc = cute::UMMA::make_instr_desc_block_scaled<
                 b_dtype_t, a_dtype_t, float, cutlass::float_ue8m0_t,
@@ -1858,10 +2546,18 @@ sm100_mega_moe_m2n_eg_impl(int* cumulative_local_expert_recv_stats,
                                          const uint32_t& m_block_idx, const uint32_t& n_block_idx) {
                 mma::sm100::update_instr_desc_with_umma_n(instr_desc, scheduler.template get_valid_m<true>());
 
-                const auto accum_stage_idx = current_iter_idx % kNumEpilogueStages;
-                const auto accum_phase = (current_iter_idx ++ / kNumEpilogueStages) & 1;
-                tmem_empty_barriers[accum_stage_idx]->wait(accum_phase ^ 1);
-                ptx::tcgen05_after_thread_sync();
+                // One lambda per block, as in the TMA warps
+                const auto issue_block = [&]() {
+                // An accumulator per block, or per K block under exact block scales
+                uint32_t accum_stage_idx = 0;
+                const auto acquire_accum = [&]() {
+                    accum_stage_idx = current_iter_idx % kNumEpilogueStages;
+                    const auto accum_phase = (current_iter_idx ++ / kNumEpilogueStages) & 1;
+                    tmem_empty_barriers[accum_stage_idx]->wait(accum_phase ^ 1);
+                    ptx::tcgen05_after_thread_sync();
+                };
+                if constexpr (not kExactBlockScales)
+                    acquire_accum();
 
                 auto empty_barrier_arrive = [&](const bool& do_tmem_full_arrive) {
                     auto umma_arrive = [](const uint64_t* barrier) {
@@ -1876,6 +2572,10 @@ sm100_mega_moe_m2n_eg_impl(int* cumulative_local_expert_recv_stats,
 
                 #pragma unroll 2
                 for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
+                    if constexpr (kExactBlockScales) {
+                        if (k_block_idx % kNumKBlocksPerAccum == 0)
+                            acquire_accum();
+                    }
                     full_barriers[stage_idx]->wait(phase);
                     ptx::tcgen05_after_thread_sync();
 
@@ -1906,15 +2606,18 @@ sm100_mega_moe_m2n_eg_impl(int* cumulative_local_expert_recv_stats,
                             b_desc.lo = mma::sm100::advance_umma_desc_lo<
                                 cute::UMMA::Major::K, LOAD_BLOCK_N, kSwizzleBMode, b_dtype_t>(b_desc_base_lo, 0, k * UMMA_K);
                             ptx::SM100_MMA_MXF8F6F4_2x1SM_SS::fma(
-                                b_desc, a_desc, accum_stage_idx * UMMA_N,
-                                k_block_idx > 0 or k > 0, runtime_instr_desc,
+                                b_desc, a_desc, accum_stage_idx * kAccumStageCols + (k_block_idx % kNumKBlocksPerAccum) * UMMA_N,
+                                (not kExactBlockScales and k_block_idx > 0) or k > 0, runtime_instr_desc,
                                 kTmemStartColOfSFB, kTmemStartColOfSFA);
                         }
                     }
                     __syncwarp();
 
-                    empty_barrier_arrive(k_block_idx == num_k_blocks - 1);
+                    empty_barrier_arrive(k_block_idx == num_k_blocks - 1 or
+                                         (kExactBlockScales and k_block_idx % kNumKBlocksPerAccum == kNumKBlocksPerAccum - 1));
                 }
+                };
+                issue_block();
             });
 
             // To safely deconstruct barriers, we need another round of waits
@@ -1924,9 +2627,9 @@ sm100_mega_moe_m2n_eg_impl(int* cumulative_local_expert_recv_stats,
             }
         }
         if (do_timing_mma_leader)
-            eg_timing_add<kNumLanes>(debug_timings, layer_i, lane_i, EGTimingSlot::MmaLoop, clock64() - loop_t0);
+            eg_timing_add<kNumLanes * 2>(debug_timings, layer_i, lane_i * 2 + pass, EGTimingSlot::MmaLoop, clock64() - loop_t0);
         if (do_timing_mma_leader)
-            eg_timing_store<kNumLanes>(debug_timings, layer_i, lane_i, EGTimingSlot::MmaEndTime, clock64());
+            eg_timing_store<kNumLanes * 2>(debug_timings, layer_i, lane_i * 2 + pass, EGTimingSlot::MmaEndTime, clock64());
     } else if (warp_idx == kNumDispatchWarps + 3) {
         // Adjust registers
         cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
@@ -1961,24 +2664,114 @@ sm100_mega_moe_m2n_eg_impl(int* cumulative_local_expert_recv_stats,
         const bool do_timing_epi_leader = do_timing_leader and epilogue_warp_idx == 0;
         unsigned long long loop_t0 = do_timing_epi_leader ? clock64() : 0;
         if (do_timing_epi_leader)
-            eg_timing_store<kNumLanes>(debug_timings, layer_i, lane_i, EGTimingSlot::EpiStartTime, loop_t0);
+            eg_timing_store<kNumLanes * 2>(debug_timings, layer_i, lane_i * 2 + pass, EGTimingSlot::EpiStartTime, loop_t0);
         auto& current_iter_idx = epi_iter_idx;
         scheduler.for_each_block([&](const sched::BlockPhase& block_phase,
                                      const uint32_t& local_expert_idx,
                                      const uint32_t& num_k_blocks,
                                      const uint32_t& m_block_idx, const uint32_t& n_block_idx) {
-            // Wait UMMA arrival
-            const auto accum_stage_idx = current_iter_idx % kNumEpilogueStages;
-            const auto accum_phase = (current_iter_idx ++ / kNumEpilogueStages) & 1;
-            tmem_full_barriers[accum_stage_idx]->wait(accum_phase);
-            ptx::tcgen05_after_thread_sync();
-
             const uint32_t valid_m = ptx::exchange(scheduler.template get_valid_m<false>(), 0);
+
+            // The block's accumulator: in TMEM, or under exact block scales in
+            // registers, the sum over K blocks of each K block's accumulator times
+            // its weight block scale's residual. Atom j (8 columns) of this
+            // warpgroup's columns is exact_accum[j].
+            uint32_t accum_stage_idx = 0;
+            float exact_accum[kExactBlockScales ? WG_BLOCK_M / ATOM_M : 1][ATOM_M];
+            if constexpr (kExactBlockScales) {
+                constexpr uint32_t kNumL1BlockNs = L1_SHAPE_N / BLOCK_N, kNumL1BlockKs = L1_SHAPE_K / BLOCK_K;
+                constexpr uint32_t kNumL2BlockNs = L2_SHAPE_N / BLOCK_N, kNumL2BlockKs = L2_SHAPE_K / BLOCK_K;
+                constexpr uint32_t kNumResidualsPerExpert = kNumL1BlockNs * kNumL1BlockKs + kNumL2BlockNs * kNumL2BlockKs;
+                DG_STATIC_ASSERT(L1_SHAPE_N % (2 * BLOCK_N) == 0, "Gate and up halves must be whole scale blocks");
+                const float* residuals = block_scale_residual_ptrs[layer_i] + local_expert_idx * kNumResidualsPerExpert;
+                // An L1 block holds 64 gate rows of scale block n_block_idx / 2 and the
+                // matching 64 up rows (granularity 8 interleave); an atom's values 0, 1,
+                // 4, 5 are gate rows and 2, 3, 6, 7 up rows. An L2 block is one scale block.
+                const float* gate_residuals = block_phase == sched::BlockPhase::Linear1
+                    ? residuals + (n_block_idx / 2) * kNumL1BlockKs
+                    : residuals + kNumL1BlockNs * kNumL1BlockKs + n_block_idx * kNumL2BlockKs;
+                const float* up_residuals = block_phase == sched::BlockPhase::Linear1
+                    ? residuals + (kNumL1BlockNs / 2 + n_block_idx / 2) * kNumL1BlockKs
+                    : gate_residuals;
+                #pragma unroll
+                for (uint32_t j = 0; j < WG_BLOCK_M / ATOM_M; ++ j) {
+                    #pragma unroll
+                    for (uint32_t v = 0; v < ATOM_M; ++ v)
+                        exact_accum[j][v] = 0;
+                }
+                // Each K block's residuals are loaded one K block ahead: with the MMA ahead of the
+                // epilogue the accumulator is usually ready, and the load would be the wait
+                float next_gate_residual = __ldg(gate_residuals), next_up_residual = __ldg(up_residuals);
+                for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; ++ k_block_idx) {
+                    // K block k_block_idx is column block k_in_accum of its accumulator stage
+                    const uint32_t k_in_accum = k_block_idx % kNumKBlocksPerAccum;
+                    const float gate_residual = next_gate_residual, up_residual = next_up_residual;
+                    if (k_block_idx + 1 < num_k_blocks) {
+                        next_gate_residual = __ldg(gate_residuals + k_block_idx + 1);
+                        next_up_residual = __ldg(up_residuals + k_block_idx + 1);
+                    }
+                    if (k_in_accum == 0) {
+                        accum_stage_idx = current_iter_idx % kNumEpilogueStages;
+                        const auto accum_phase = (current_iter_idx ++ / kNumEpilogueStages) & 1;
+                        tmem_full_barriers[accum_stage_idx]->wait(accum_phase);
+                        ptx::tcgen05_after_thread_sync();
+                    }
+                    // Loads of up to four atoms (a divisor of the atom count), then one wait for
+                    // them; atoms of the store blocks the loops below skip (past valid_m) are
+                    // skipped here too
+                    constexpr uint32_t kNumAtoms = WG_BLOCK_M / ATOM_M;
+                    constexpr uint32_t kNumAtomsPerWait = kNumAtoms % 4 == 0 ? 4 : kNumAtoms % 3 == 0 ? 3 :
+                                                          kNumAtoms % 2 == 0 ? 2 : 1;
+                    #pragma unroll
+                    for (uint32_t j0 = 0; j0 < kNumAtoms; j0 += kNumAtomsPerWait) {
+                        if (epilogue_wg_idx * WG_BLOCK_M + (j0 / kNumAtomsPerStore) * STORE_BLOCK_M >= valid_m)
+                            break;
+                        uint32_t values[kNumAtomsPerWait][ATOM_M];
+                        #pragma unroll
+                        for (uint32_t a = 0; a < kNumAtomsPerWait; ++ a) {
+                            const uint32_t tmem_addr = accum_stage_idx * kAccumStageCols + k_in_accum * UMMA_N +
+                                                       epilogue_wg_idx * WG_BLOCK_M + (j0 + a) * ATOM_M;
+                            cute::SM100_TMEM_LOAD_16dp256b1x::copy(tmem_addr,
+                                values[a][0], values[a][1], values[a][2], values[a][3]);
+                            cute::SM100_TMEM_LOAD_16dp256b1x::copy(tmem_addr | 0x00100000,
+                                values[a][4], values[a][5], values[a][6], values[a][7]);
+                        }
+                        cutlass::arch::fence_view_async_tmem_load();
+                        #pragma unroll
+                        for (uint32_t a = 0; a < kNumAtomsPerWait; ++ a) {
+                            #pragma unroll
+                            for (uint32_t v = 0; v < ATOM_M; ++ v) {
+                                exact_accum[j0 + a][v] = fmaf((v & 2) ? up_residual : gate_residual,
+                                                              __uint_as_float(values[a][v]), exact_accum[j0 + a][v]);
+                            }
+                        }
+                    }
+                    if (k_in_accum == kNumKBlocksPerAccum - 1 or k_block_idx == num_k_blocks - 1) {
+                        ptx::tcgen05_before_thread_sync();
+                        tmem_empty_barriers[accum_stage_idx]->arrive(0u);
+                    }
+                }
+            } else {
+                // Wait UMMA arrival
+                accum_stage_idx = current_iter_idx % kNumEpilogueStages;
+                const auto accum_phase = (current_iter_idx ++ / kNumEpilogueStages) & 1;
+                tmem_full_barriers[accum_stage_idx]->wait(accum_phase);
+                ptx::tcgen05_after_thread_sync();
+            }
+            // Free the block's TMEM accumulator (exact block scales freed each K block's)
+            const auto release_accum = [&]() {
+                if constexpr (not kExactBlockScales) {
+                    ptx::tcgen05_before_thread_sync();
+                    tmem_empty_barriers[accum_stage_idx]->arrive(0u);
+                }
+            };
             const uint32_t pool_block_idx = scheduler.get_current_pool_block_offset() + m_block_idx;
             uint32_t m_idx = pool_block_idx * BLOCK_M;
             uint32_t n_idx = n_block_idx * BLOCK_N;
 
             if (block_phase == sched::BlockPhase::Linear1) {
+              // One lambda, as the per-block bodies of the TMA and MMA warps
+              const auto l1_epilogue = [&]() {
                 // Unified L1 epilogue: SwiGLU in-place using granularity 8 interleaved weights
                 // With `SM100_TMEM_LOAD_16dp256b1x`, gate/up pairs are:
                 //   (values[0], values[2]), (values[1], values[3]),
@@ -1988,8 +2781,7 @@ sm100_mega_moe_m2n_eg_impl(int* cumulative_local_expert_recv_stats,
                 #pragma unroll
                 for (uint32_t s = 0; s < WG_BLOCK_M / STORE_BLOCK_M; ++ s) {
                     if (epilogue_wg_idx * WG_BLOCK_M + s * STORE_BLOCK_M >= valid_m) {
-                        ptx::tcgen05_before_thread_sync();
-                        tmem_empty_barriers[accum_stage_idx]->arrive(0u);
+                        release_accum();
                         break;
                     }
 
@@ -2011,19 +2803,23 @@ sm100_mega_moe_m2n_eg_impl(int* cumulative_local_expert_recv_stats,
                             ptx::exchange(stored_cached_weight, (j * ATOM_M) % 32 + (lane_idx % 4) * 2 + 1)
                         };
 
-                        // Load from TMEM
-                        uint32_t tmem_addr = accum_stage_idx * UMMA_N + epilogue_wg_idx * WG_BLOCK_M + j * ATOM_M;
+                        // Load from TMEM (or the exact accumulator)
                         uint32_t values[ATOM_M];
-                        cute::SM100_TMEM_LOAD_16dp256b1x::copy(tmem_addr,
-                                                               values[0], values[1], values[2], values[3]);
-                        cute::SM100_TMEM_LOAD_16dp256b1x::copy(tmem_addr | 0x00100000,
-                                                               values[4], values[5], values[6], values[7]);
-                        cutlass::arch::fence_view_async_tmem_load();
-
-                        if (j == WG_BLOCK_M / ATOM_M - 1) {
-                            ptx::tcgen05_before_thread_sync();
-                            tmem_empty_barriers[accum_stage_idx]->arrive(0u);
+                        if constexpr (kExactBlockScales) {
+                            #pragma unroll
+                            for (uint32_t v = 0; v < ATOM_M; ++ v)
+                                values[v] = __float_as_uint(exact_accum[j][v]);
+                        } else {
+                            uint32_t tmem_addr = accum_stage_idx * kAccumStageCols + epilogue_wg_idx * WG_BLOCK_M + j * ATOM_M;
+                            cute::SM100_TMEM_LOAD_16dp256b1x::copy(tmem_addr,
+                                                                   values[0], values[1], values[2], values[3]);
+                            cute::SM100_TMEM_LOAD_16dp256b1x::copy(tmem_addr | 0x00100000,
+                                                                   values[4], values[5], values[6], values[7]);
+                            cutlass::arch::fence_view_async_tmem_load();
                         }
+
+                        if (j == WG_BLOCK_M / ATOM_M - 1)
+                            release_accum();
 
                         // Apply SwiGLU: silu(gate) * up
                         // Gate/up pairs: (0, 2), (1, 3), (4, 6), (5, 7)
@@ -2132,6 +2928,8 @@ sm100_mega_moe_m2n_eg_impl(int* cumulative_local_expert_recv_stats,
                     );
                 }
                 __syncwarp();
+              };
+              l1_epilogue();
             } else {
                 DG_STATIC_ASSERT(STORE_BLOCK_M % 8 == 0, "Invalid store M");
                 constexpr uint32_t kNumRowsPerWarp = STORE_BLOCK_M / 8;
@@ -2143,28 +2941,31 @@ sm100_mega_moe_m2n_eg_impl(int* cumulative_local_expert_recv_stats,
                 #pragma unroll
                 for (uint32_t s = 0; s < WG_BLOCK_M / STORE_BLOCK_M; ++ s) {
                     if (epilogue_wg_idx * WG_BLOCK_M + s * STORE_BLOCK_M >= valid_m) {
-                        ptx::tcgen05_before_thread_sync();
-                        tmem_empty_barriers[accum_stage_idx]->arrive(0u);
+                        release_accum();
                         break;
                     }
 
                     #pragma unroll
                     for (uint32_t i = 0; i < STORE_BLOCK_M / ATOM_M; ++ i) {
-                        uint32_t tmem_addr = accum_stage_idx * UMMA_N + epilogue_wg_idx * WG_BLOCK_M + s * STORE_BLOCK_M + i * ATOM_M;
                         uint32_t values[ATOM_M];
-                        cute::SM100_TMEM_LOAD_16dp256b1x::copy(tmem_addr,
-                                                               values[0], values[1], values[2], values[3]);
-                        cute::SM100_TMEM_LOAD_16dp256b1x::copy(tmem_addr | 0x00100000,
-                                                               values[4], values[5], values[6], values[7]);
-                        cutlass::arch::fence_view_async_tmem_load();
+                        if constexpr (kExactBlockScales) {
+                            #pragma unroll
+                            for (uint32_t v = 0; v < ATOM_M; ++ v)
+                                values[v] = __float_as_uint(exact_accum[s * (STORE_BLOCK_M / ATOM_M) + i][v]);
+                        } else {
+                            uint32_t tmem_addr = accum_stage_idx * kAccumStageCols + epilogue_wg_idx * WG_BLOCK_M + s * STORE_BLOCK_M + i * ATOM_M;
+                            cute::SM100_TMEM_LOAD_16dp256b1x::copy(tmem_addr,
+                                                                   values[0], values[1], values[2], values[3]);
+                            cute::SM100_TMEM_LOAD_16dp256b1x::copy(tmem_addr | 0x00100000,
+                                                                   values[4], values[5], values[6], values[7]);
+                            cutlass::arch::fence_view_async_tmem_load();
+                        }
 
                         if (i == 0 and s > 0)
                             ptx::sync_aligned(128, kEpilogueWGBarrierStartIdx + epilogue_wg_idx);
 
-                        if (s == WG_BLOCK_M / STORE_BLOCK_M - 1 and i == STORE_BLOCK_M / ATOM_M - 1) {
-                            ptx::tcgen05_before_thread_sync();
-                            tmem_empty_barriers[accum_stage_idx]->arrive(0u);
-                        }
+                        if (s == WG_BLOCK_M / STORE_BLOCK_M - 1 and i == STORE_BLOCK_M / ATOM_M - 1)
+                            release_accum();
 
                         uint32_t row = lane_idx % 8;
                         uint32_t col = (epilogue_warp_idx % 2) * 4 + lane_idx / 8;
@@ -2206,7 +3007,7 @@ sm100_mega_moe_m2n_eg_impl(int* cumulative_local_expert_recv_stats,
                             (lane_idx % 16 / 8) * STORE_BLOCK_M * kSwizzleCDMode +
                             row_in_store * kSwizzleCDMode +
                             (bank_group_idx ^ row_in_atom) * kNumBankGroupBytes;
-                        const auto packed = ptx::ld_shared(reinterpret_cast<float4*>(smem_ptr));
+                        auto packed = ptx::ld_shared(reinterpret_cast<float4*>(smem_ptr));
 
                         const auto dst_token = combine_token_buffer.get_rank_buffer(dst_topk_idx)
                                                .get_data_buffer(dst_token_idx);
@@ -2219,35 +3020,50 @@ sm100_mega_moe_m2n_eg_impl(int* cumulative_local_expert_recv_stats,
 
                 ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
                 if (kEnableDebugTiming and lane_idx == 0)
-                    eg_timing_add<kNumLanes>(debug_timings, layer_i, lane_i, EGTimingSlot::L2RemoteWriteback, clock64() - writeback_t0);
+                    eg_timing_add<kNumLanes * 2>(debug_timings, layer_i, lane_i * 2 + pass, EGTimingSlot::L2RemoteWriteback, clock64() - writeback_t0);
             }
         });
         if (do_timing_epi_leader)
-            eg_timing_add<kNumLanes>(debug_timings, layer_i, lane_i, EGTimingSlot::EpilogueLoop, clock64() - loop_t0);
+            eg_timing_add<kNumLanes * 2>(debug_timings, layer_i, lane_i * 2 + pass, EGTimingSlot::EpilogueLoop, clock64() - loop_t0);
         if (do_timing_epi_leader)
-            eg_timing_store<kNumLanes>(debug_timings, layer_i, lane_i, EGTimingSlot::EpiEndTime, clock64());
+            eg_timing_store<kNumLanes * 2>(debug_timings, layer_i, lane_i * 2 + pass, EGTimingSlot::EpiEndTime, clock64());
 
-        // Deallocate tensor memory (only at the very END: last layer, last lane)
-        if (layer_i == num_layers - 1 and lane_i == kNumLanes - 1 and epilogue_warp_idx == 0)
+        // Deallocate tensor memory (only at the very END: last layer, last lane, last pass)
+        if (layer_i == num_layers - 1 and lane_i == kNumLanes - 1 and last_pass and epilogue_warp_idx == 0)
             Allocator().free(0, kNumTmemCols);
 
         // Signal the AG ranks that all combine rows have been pushed
         unsigned long long tag2_t0 = (do_timing_leader and epilogue_warp_idx == 0) ? clock64() : 0;
+        if constexpr (kP2P) {
+            // Release every AG rank once all SMs wrote back; no wait for them
+            comm::grid_sync<kNumSMs, kEpilogueGridSyncIndex>(
+                workspace, sm_idx, epilogue_thread_idx,
+                [&]() { ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx); });
+            // The rows of source `src` went back to it; a pass releases only its
+            // own sources.
+            if (sm_idx == 0 and epilogue_thread_idx < kNumAGRanks) {
+                const uint32_t src = epilogue_thread_idx;
+                if (sched_src_mask == 0 or ((sched_src_mask >> src) & 1u))
+                    ptx::red_add_rel_sys(sym_buffer.map(p2p_ctrl.get_combine_count_ptr(layer_parity), src), 1);
+            }
+        } else {
         comm::nvlink_barrier<kNumRanks, kNumSMs, kNumEpilogueThreads,
                              kEpilogueGridSyncIndex, kBeforeCombineReduceBarrierTag>(
             workspace, sym_buffer, sm_idx, epilogue_thread_idx,
             [&]() { ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx); }
         );
+        }
         if (do_timing_leader and epilogue_warp_idx == 0) {
-            eg_timing_add<kNumLanes>(debug_timings, layer_i, lane_i, EGTimingSlot::Tag2Barrier, clock64() - tag2_t0);
-            eg_timing_store<kNumLanes>(debug_timings, layer_i, lane_i, EGTimingSlot::Tag2EndTime, clock64());
-            eg_timing_store<kNumLanes>(debug_timings, layer_i, lane_i, EGTimingSlot::LaneEnd, clock64());
+            eg_timing_add<kNumLanes * 2>(debug_timings, layer_i, lane_i * 2 + pass, EGTimingSlot::Tag2Barrier, clock64() - tag2_t0);
+            eg_timing_store<kNumLanes * 2>(debug_timings, layer_i, lane_i * 2 + pass, EGTimingSlot::Tag2EndTime, clock64());
+            eg_timing_store<kNumLanes * 2>(debug_timings, layer_i, lane_i * 2 + pass, EGTimingSlot::LaneEnd, clock64());
         }
 
         // Barrier with dispatch warps, so that they can clean the workspace.
         // No local combine reduction on EG ranks.
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
     }
+    }  // pass loop
     }  // lane loop
     }  // layer loop
 #else

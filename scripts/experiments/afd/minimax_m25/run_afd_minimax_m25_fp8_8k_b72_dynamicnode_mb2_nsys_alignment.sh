@@ -167,8 +167,8 @@ export VLLM_MOE_USE_DEEP_GEMM="${VLLM_MOE_USE_DEEP_GEMM:-0}"
 # A few boundary tokens can land at rank 11/12 while top100 remains 1.0.
 export ALIGN_MIN_TOP10_RATE="${ALIGN_MIN_TOP10_RATE:-0.999}"
 
-export CLEAN_FIRST="${CLEAN_FIRST:-1}"
-export CLEAN_AFTER="${CLEAN_AFTER:-1}"
+export CLEAN_FIRST="${CLEAN_FIRST:-0}"
+export CLEAN_AFTER="${CLEAN_AFTER:-0}"
 export POST_SHUTDOWN_SLEEP="${POST_SHUTDOWN_SLEEP:-20}"
 export AFD_STOP_TIMEOUT_S="${AFD_STOP_TIMEOUT_S:-90}"
 

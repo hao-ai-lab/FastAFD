@@ -84,7 +84,7 @@ def qwen3_afd_topk(
             dispatch_fp8=dispatch_fp8,
         )
 
-    from minisgl.kernel import topk_gating
+    from minisgl.kernel import topk_softmax
 
     num_tokens = router_logits.shape[0]
     weights = torch.empty(
@@ -97,11 +97,10 @@ def qwen3_afd_topk(
         dtype=torch.int32,
         device=router_logits.device,
     )
-    topk_gating(
+    topk_softmax(
         weights,
         ids,
         router_logits.contiguous(),
-        scoring="softmax",
         renormalize=renormalize,
     )
     return Qwen3AfdTopK(
@@ -200,6 +199,10 @@ class Qwen3AfdDenseRouterStage(BaseOP):
 
 
 class Qwen3AfdDenseRouterForCausalLM(BaseOP):
+    # route() is the router alone, local to this rank (no TP collective, shared expert or
+    # dense layer): the AFD MB pipeline may run it on the lane stream (MINISGL_AFD_ROUTE_ON_LANE)
+    afd_route_is_local = True
+
     def __init__(self, config: ModelConfig):
         self.model = Qwen3AfdDenseRouterStage(config)
         self.lm_head = ParallelLMHead(

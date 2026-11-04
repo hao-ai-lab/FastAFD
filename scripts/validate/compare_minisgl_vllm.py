@@ -6,6 +6,7 @@ import concurrent.futures
 import json
 import math
 import sys
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -24,6 +25,8 @@ class MiniSGLSample:
     prompt: str
     generated_text: str
     generated_token_ids: list[int]
+    ttft_seconds: float | None = None
+    latency_seconds: float | None = None
 
 
 def add_prompt_args(parser: argparse.ArgumentParser) -> None:
@@ -130,6 +133,11 @@ def parse_args() -> argparse.Namespace:
     )
     score_parser.add_argument("--timeout", type=float, default=600.0, help="HTTP timeout in seconds.")
     score_parser.add_argument("--output-json", type=Path, help="Optional path to write the scored report JSON.")
+    score_parser.add_argument(
+        "--reference-identity-json",
+        type=Path,
+        help="Reference identity written by vllm_server.sh --identity-json; copied into the report.",
+    )
 
     compare_parser = subparsers.add_parser(
         "compare",
@@ -270,6 +278,8 @@ def generate_with_minisgl(
     }
     text_parts: list[str] = []
     token_ids: list[int] = []
+    started_at = time.perf_counter()
+    first_token_at: float | None = None
     for chunk in stream_json_sse(f"{base_url.rstrip('/')}/v1/chat/completions", payload, timeout):
         choice = chunk["choices"][0]
         delta = choice.get("delta") or {}
@@ -277,11 +287,16 @@ def generate_with_minisgl(
         if content:
             text_parts.append(content)
         chunk_token_ids = choice.get("token_ids") or []
+        if chunk_token_ids and first_token_at is None:
+            first_token_at = time.perf_counter()
         token_ids.extend(int(token_id) for token_id in chunk_token_ids)
+    finished_at = time.perf_counter()
     return MiniSGLSample(
         prompt=prompt,
         generated_text="".join(text_parts),
         generated_token_ids=token_ids,
+        ttft_seconds=(first_token_at - started_at) if first_token_at is not None else None,
+        latency_seconds=finished_at - started_at,
     )
 
 
@@ -697,7 +712,51 @@ def print_report(summary: dict[str, Any], results: list[dict[str, Any]]) -> None
         print("")
 
 
-def sample_bundle_to_json(samples: list[MiniSGLSample], tokenizer_model: str) -> dict[str, Any]:
+def sample_bundle_to_json(
+    samples: list[MiniSGLSample],
+    tokenizer_model: str,
+    *,
+    workload_elapsed_seconds: float | None = None,
+    sample_concurrency: int | None = None,
+    batch_submit: bool | None = None,
+) -> dict[str, Any]:
+    total_generated_tokens = sum(len(sample.generated_token_ids) for sample in samples)
+    ttfts = [float(sample.ttft_seconds) for sample in samples if sample.ttft_seconds is not None]
+    latencies = [
+        float(sample.latency_seconds)
+        for sample in samples
+        if sample.latency_seconds is not None
+    ]
+    tpots = [
+        max(0.0, float(sample.latency_seconds) - float(sample.ttft_seconds))
+        / (len(sample.generated_token_ids) - 1)
+        for sample in samples
+        if sample.latency_seconds is not None
+        and sample.ttft_seconds is not None
+        and len(sample.generated_token_ids) > 1
+    ]
+    elapsed = (
+        float(workload_elapsed_seconds)
+        if workload_elapsed_seconds is not None
+        else None
+    )
+    performance = {
+        "measurement_mode": (
+            "batch_non_streaming" if batch_submit else "streaming_per_request"
+        ) if batch_submit is not None else None,
+        "sample_concurrency": sample_concurrency,
+        "workload_elapsed_seconds": elapsed,
+        "generated_throughput_tokens_per_second": (
+            total_generated_tokens / elapsed
+            if elapsed is not None and elapsed > 0
+            else None
+        ),
+        "mean_ttft_seconds": safe_mean(ttfts),
+        "mean_tpot_seconds": safe_mean(tpots),
+        "mean_request_latency_seconds": safe_mean(latencies),
+        "timed_request_count": len(latencies),
+        "timed_tpot_request_count": len(tpots),
+    }
     return {
         "tokenizer_model": tokenizer_model,
         "samples": [
@@ -705,13 +764,26 @@ def sample_bundle_to_json(samples: list[MiniSGLSample], tokenizer_model: str) ->
                 "prompt": sample.prompt,
                 "generated_text": sample.generated_text,
                 "generated_token_ids": sample.generated_token_ids,
+                "timing": {
+                    "ttft_seconds": sample.ttft_seconds,
+                    "latency_seconds": sample.latency_seconds,
+                    "tpot_seconds": (
+                        max(0.0, sample.latency_seconds - sample.ttft_seconds)
+                        / (len(sample.generated_token_ids) - 1)
+                        if sample.latency_seconds is not None
+                        and sample.ttft_seconds is not None
+                        and len(sample.generated_token_ids) > 1
+                        else None
+                    ),
+                },
             }
             for sample in samples
         ],
         "summary": {
             "num_prompts": len(samples),
-            "total_generated_tokens": sum(len(sample.generated_token_ids) for sample in samples),
+            "total_generated_tokens": total_generated_tokens,
         },
+        "performance": performance,
     }
 
 
@@ -725,6 +797,7 @@ def sample_bundle_from_json(path: Path) -> dict[str, Any]:
 def run_sample(args: argparse.Namespace) -> int:
     prompts = load_prompts(args.prompt, args.prompt_file, args.prompt_repeat)
     minisgl_model = get_first_served_model(args.minisgl_url, args.timeout)
+    workload_started_at = time.perf_counter()
     samples = sample_prompts_with_minisgl(
         prompts=prompts,
         base_url=args.minisgl_url,
@@ -738,7 +811,14 @@ def run_sample(args: argparse.Namespace) -> int:
         batch_submit=args.batch_submit,
         ignore_eos=args.ignore_eos,
     )
-    bundle = sample_bundle_to_json(samples, tokenizer_model=args.model)
+    workload_elapsed_seconds = time.perf_counter() - workload_started_at
+    bundle = sample_bundle_to_json(
+        samples,
+        tokenizer_model=args.model,
+        workload_elapsed_seconds=workload_elapsed_seconds,
+        sample_concurrency=args.sample_concurrency,
+        batch_submit=args.batch_submit,
+    )
     if args.sample_json is not None:
         args.sample_json.write_text(json.dumps(bundle, ensure_ascii=False, indent=2), encoding="utf-8")
     print_sample_summary(bundle)
@@ -765,6 +845,21 @@ def run_vllm_sample(args: argparse.Namespace) -> int:
         args.sample_json.write_text(json.dumps(bundle, ensure_ascii=False, indent=2), encoding="utf-8")
     print_sample_summary(bundle)
     return 0
+
+
+def load_reference_identity(path: Path | None) -> dict[str, Any] | None:
+    """Read the identity vllm_server.sh --identity-json recorded; warn and return None if unusable."""
+    if path is None:
+        return None
+    try:
+        identity = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        print(f"WARNING: no reference identity recorded ({path}: {error})", file=sys.stderr)
+        return None
+    if not isinstance(identity, dict):
+        print(f"WARNING: reference identity in {path} is not a JSON object", file=sys.stderr)
+        return None
+    return identity
 
 
 def run_score(args: argparse.Namespace) -> int:
@@ -819,8 +914,12 @@ def run_score(args: argparse.Namespace) -> int:
         "tokenizer_model": tokenizer_model,
         "prompt_logprobs": args.prompt_logprobs,
         "summary": summary,
-        "results": finalized_results,
+        "fastafd_performance": bundle.get("performance"),
     }
+    reference_identity = load_reference_identity(args.reference_identity_json)
+    if reference_identity is not None:
+        report["reference_identity"] = reference_identity
+    report["results"] = finalized_results
     if args.output_json is not None:
         args.output_json.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     print_report(summary, finalized_results)

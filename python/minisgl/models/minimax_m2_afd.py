@@ -33,6 +33,18 @@ class _MiniMaxM2RouterGate(BaseOP):
             if config.use_routing_bias
             else None
         )
+        # The gate again in the order the router kernel reads with float4 loads (same
+        # logits; 3 MB per layer). Not part of the state dict.
+        self._gate_lane_major: torch.Tensor | None = None
+
+    def load_state_dict(self, state_dict, *, prefix: str = "", _internal: bool = False) -> None:
+        super().load_state_dict(state_dict, prefix=prefix, _internal=_internal)
+        weight = self.gate.weight
+        self._gate_lane_major = None
+        if weight.is_cuda and weight.dtype == torch.float32 and weight.shape[1] % 128 == 0:
+            from minisgl.kernel.moe_topk import minimax_route_lane_major
+
+            self._gate_lane_major = minimax_route_lane_major(weight)
 
 
 class MiniMaxM2AfdAGLayer(BaseOP):
@@ -85,6 +97,7 @@ class MiniMaxM2AfdAGLayer(BaseOP):
                 renormalize=self.renormalize,
                 quant_out=quant_out,
                 pre_sigmoid=quant_out is not None,
+                gate_weight_lane_major=self.mlp._gate_lane_major,
             )
             return MiniMaxM2AfdTopK(
                 topk_ids=ids,
@@ -158,6 +171,10 @@ class MiniMaxM2AfdDenseRouterStage(BaseOP):
 
 
 class MiniMaxM2AfdDenseRouterForCausalLM(BaseOP):
+    # route() is the router alone, local to this rank (no TP collective, shared expert or
+    # dense layer): the AFD MB pipeline may run it on the lane stream (MINISGL_AFD_ROUTE_ON_LANE)
+    afd_route_is_local = True
+
     def __init__(self, config: ModelConfig):
         self.model = MiniMaxM2AfdDenseRouterStage(config)
         self.lm_head = ParallelLMHead(

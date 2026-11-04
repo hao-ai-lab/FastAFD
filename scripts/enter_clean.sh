@@ -17,6 +17,15 @@ if [[ $# -ne 1 ]]; then
 fi
 
 ENV_NAME="$1"
+# Honor an explicit CONDA_SH; otherwise pick whichever conda install exists.
+if [[ -z "${CONDA_SH:-}" ]]; then
+  for _cand in "$HOME/miniforge3" "$HOME/miniconda3" "$HOME/anaconda3"; do
+    if [[ -f "$_cand/etc/profile.d/conda.sh" ]]; then
+      CONDA_SH="$_cand/etc/profile.d/conda.sh"
+      break
+    fi
+  done
+fi
 CONDA_SH="${CONDA_SH:-$HOME/miniforge3/etc/profile.d/conda.sh}"
 START_DIR="${PWD}"
 WORKDIR="${WORKDIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
@@ -71,6 +80,13 @@ PY
     export TRITON_PTXAS_BLACKWELL_PATH=\"\${CONDA_PREFIX}/bin/ptxas\"
     export LD_LIBRARY_PATH=\"\${CONDA_PREFIX}/lib:\${CONDA_PREFIX}/targets/sbsa-linux/lib\${NCCL_PIP_LIB:+:\${NCCL_PIP_LIB}}\${LD_LIBRARY_PATH:+:\${LD_LIBRARY_PATH}}\"
     export LIBRARY_PATH=\"\${CONDA_PREFIX}/lib:\${CONDA_PREFIX}/targets/sbsa-linux/lib\${NCCL_PIP_LIB:+:\${NCCL_PIP_LIB}}\${LIBRARY_PATH:+:\${LIBRARY_PATH}}\"
+    # JIT builds (FlashInfer: -L\$CUDA_HOME/lib64/stubs -lcuda) link against the
+    # driver stub. CUDA 13 Conda envs keep it in lib/stubs, not lib64/stubs, so
+    # a cold cache fails with 'cannot find -lcuda'. Search it last: link time
+    # only, and the real libcuda.so.1 still comes from the driver at run time.
+    if [[ -e \"\${CONDA_PREFIX}/lib/stubs/libcuda.so\" ]]; then
+      export LIBRARY_PATH=\"\${LIBRARY_PATH}:\${CONDA_PREFIX}/lib/stubs\"
+    fi
     export FLASHINFER_WORKSPACE_BASE=\"${CACHE_ROOT}/flashinfer\"
     export TVM_FFI_CACHE_DIR=\"${CACHE_ROOT}/tvm-ffi\"
     export EP_JIT_CACHE_DIR=\"${CACHE_ROOT}/deepep-jit\"

@@ -297,7 +297,21 @@ class DeepGEMMGroupedRunner(MoeRunner):
 
     @staticmethod
     def _activation_fn(name: str):
-        return glm4_silu_and_mul if name == "glm4_silu" else silu_and_mul
+        """Look up the expert activation, refusing rather than defaulting.
+
+        An unrecognised activation (e.g. `swigluoai`, a different function
+        with an asymmetric clamp and an `(up + 1)` term) must not silently
+        become plain SiLU; `moe/fused.py`'s FN_MAP raises on an unknown name
+        too.
+        """
+        fns = {"silu": silu_and_mul, "glm4_silu": glm4_silu_and_mul}
+        if name not in fns:
+            raise NotImplementedError(
+                f"DeepGEMM grouped runner has no {name!r} activation; it "
+                f"implements {sorted(fns)}. Defaulting to SiLU would return a "
+                "plausible but wrong tensor."
+            )
+        return fns[name]
 
     @staticmethod
     def _apply_expanded_topk_weights(output: torch.Tensor, dispatch_output: Any) -> torch.Tensor:

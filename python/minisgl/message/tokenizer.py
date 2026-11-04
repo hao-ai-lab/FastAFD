@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, List
 
+import torch
 from minisgl.core import SamplingParams
 
 from .utils import deserialize_type, serialize_type
@@ -51,6 +52,9 @@ class TokenizeMsg(BaseTokenizerMsg):
     uid: int
     text: str | List[Dict[str, str]]
     sampling_params: SamplingParams
+    # The prompt as int32 token ids (the API's input_ids); when set the tokenizer passes them
+    # through and `text` is unused.
+    input_ids: torch.Tensor | None = None
 
 
 @dataclass

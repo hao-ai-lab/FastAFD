@@ -2,10 +2,10 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Protocol
 
+import torch
 from minisgl.utils import Registry
 
 if TYPE_CHECKING:
-    import torch
     from minisgl.models import ModelConfig
 
 from .base import (
@@ -41,7 +41,13 @@ def create_kvcache_pool(
         head_dim=model_config.head_dim,
         device=device,
         dtype=dtype,
+        # Every layer that keeps a KV cache: Qwen3.5's linear-attention layers keep a
+        # recurrent state instead (HybridGDNStatePool) and stay out.
+        layer_ids=model_config.kv_cache_layer_ids,
     )
+
+
+from .hybrid_pool import HybridGDNStatePool, create_hybrid_gdn_state_pool
 
 
 @SUPPORTED_CACHE_MANAGER.register("naive")
@@ -71,4 +77,6 @@ __all__ = [
     "SizeInfo",
     "MatchResult",
     "SUPPORTED_CACHE_MANAGER",
+    "HybridGDNStatePool",
+    "create_hybrid_gdn_state_pool",
 ]
