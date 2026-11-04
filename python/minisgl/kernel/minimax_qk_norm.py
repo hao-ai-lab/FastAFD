@@ -19,6 +19,7 @@ def _jit_module() -> Module:
         cuda_wrappers=[
             ("launch", "MiniMaxQKNormKernel::run"),
             ("launch_rope_store", "MiniMaxQKNormKernel::run_rope_store"),
+            ("launch_rope_store_scalar", "MiniMaxQKNormKernel::run_rope_store_scalar"),
         ],
         extra_cuda_cflags=["--use_fast_math"],
     )

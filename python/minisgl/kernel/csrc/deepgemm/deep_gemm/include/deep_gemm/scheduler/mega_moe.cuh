@@ -1,6 +1,7 @@
 #pragma once
 
 #include <deep_gemm/common/cute_tie.cuh>
+#include <deep_gemm/common/hang_guard.cuh>
 #include <deep_gemm/common/math.cuh>
 #include <deep_gemm/common/types.cuh>
 #include <deep_gemm/layout/mega_moe.cuh>
@@ -182,16 +183,42 @@ struct MegaMoEScheduler {
         return {BlockPhase::None, 0, 0, 0};
     }
 
+    // Source ranks this pass serves (M2N early start): 0 = every source, read from
+    // the per-expert sums; otherwise the sum of these sources' own count slots,
+    // each waited for by the push marker in its high 32 bits. Every warp of every
+    // SM of a pass must hold the same mask.
+    uint32_t src_mask = 0;
+    // (rank << 24) | (layer << 8) | (lane << 1) | pass, for the hang guard's report
+    uint32_t dbg_tag = 0;
+
     CUTLASS_DEVICE void fetch_expert_recv_count() {
+        const auto start_clock = clock64();
         // NOTES: each lane caches experts at indices (i * 32 + lane_idx)
         #pragma unroll
         for (uint32_t i = 0; i < kNumExpertsPerLane; ++ i) {
             const auto expert_idx = i * 32 + ptx::get_lane_idx();
             uint64_t value = 0;
             if (expert_idx < kNumExpertsPerRank) {
-                do {
-                    value = ptx::ld_volatile(workspace.get_expert_recv_count_sum_ptr(expert_idx));
-                } while (static_cast<uint32_t>(value >> 32) != kRecvCountHighTarget);
+                if (src_mask == 0) {
+                    do {
+                        value = ptx::ld_volatile(workspace.get_expert_recv_count_sum_ptr(expert_idx));
+                        DG_HANG_GUARD(start_clock, "DG hang guard: EG count sum tag=%x expert=%u value=%llx\n",
+                                      dbg_tag, expert_idx, static_cast<unsigned long long>(value));
+                    } while (static_cast<uint32_t>(value >> 32) != kRecvCountHighTarget);
+                } else {
+                    uint32_t num_tokens = 0;
+                    for (uint32_t mask = src_mask; mask != 0; mask &= mask - 1) {
+                        const uint32_t src = __ffs(mask) - 1;
+                        uint64_t slot;
+                        do {
+                            slot = ptx::ld_volatile(workspace.get_expert_recv_count_ptr(src, expert_idx));
+                            DG_HANG_GUARD(start_clock, "DG hang guard: EG source slot tag=%x mask=%x src=%u expert=%u\n",
+                                          dbg_tag, src_mask, src, expert_idx);
+                        } while ((slot >> 32) == 0);
+                        num_tokens += static_cast<uint32_t>(slot);
+                    }
+                    value = num_tokens;
+                }
             }
             stored_num_tokens_per_expert[i] = static_cast<uint32_t>(value);
         }

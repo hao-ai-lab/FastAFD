@@ -15,7 +15,11 @@ def start_nsys_runtime_capture(
     reason: str,
     via_worker_queue: bool = False,
 ) -> None:
-    if not coord.server_args.ray_nsys or coord._nsys_runtime_started:
+    if (
+        not coord.server_args.ray_nsys
+        or coord._nsys_runtime_started
+        or getattr(coord, "_nsys_runtime_finished", False)
+    ):
         return
     if via_worker_queue:
         coord._broadcast_cmd_to_workers(
@@ -58,6 +62,7 @@ def stop_nsys_runtime_capture(
             ]
         )
     coord._nsys_runtime_started = False
+    coord._nsys_runtime_finished = True
     log_line(
         coord.log_path,
         f"[afd-coordinator] nsys profiler:stop reason={reason} "

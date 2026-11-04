@@ -172,7 +172,17 @@ export PYTHONUNBUFFERED=1
 # first-time kernel compilation. Mirror the vLLM startup defaults so local mp
 # runs do not depend on the caller shell pre-exporting toolchain variables.
 if [[ -n "${CONDA_PREFIX:-}" ]]; then
-  if [[ -z "${CUDA_HOME:-}" && -x "${CONDA_PREFIX}/bin/nvcc" ]]; then
+  CUDA_TARGET_ROOT="${CONDA_PREFIX}/targets/sbsa-linux"
+  if [[ -f "${CUDA_TARGET_ROOT}/include/cuda_bf16.h" ]]; then
+    export CUDA_HOME="${CONDA_PREFIX}"
+    export CUDA_PATH="${CONDA_PREFIX}"
+    export FLASHINFER_NVCC="${FLASHINFER_NVCC:-${CONDA_PREFIX}/bin/nvcc}"
+    export PATH="${CONDA_PREFIX}/nvvm/bin:${CONDA_PREFIX}/bin:${CUDA_TARGET_ROOT}/bin:${PATH}"
+    if [[ -n "${FLASHINFER_WORKSPACE_BASE:-}" && \
+          "${FLASHINFER_WORKSPACE_BASE##*/}" != "cuda-target-sbsa-linux" ]]; then
+      export FLASHINFER_WORKSPACE_BASE="${FLASHINFER_WORKSPACE_BASE%/}/cuda-target-sbsa-linux"
+    fi
+  elif [[ -z "${CUDA_HOME:-}" && -x "${CONDA_PREFIX}/bin/nvcc" ]]; then
     export CUDA_HOME="${CONDA_PREFIX}"
   fi
   if [[ -z "${CUDA_PATH:-}" && -n "${CUDA_HOME:-}" ]]; then

@@ -23,6 +23,7 @@ cache/
 
 # virtual environment
 .venv/
+.venv-*/
 venv/
 env/
 
@@ -32,3 +33,20 @@ env/
 # .vscode
 .vscode/
 .coverage
+
+# Local research state and generated output are not repository inputs.
+/reports/
+/data/
+/htmlcov/
+/.env
+/.env.*
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Small, reviewed test fixtures and public presets may use structured data.
+!tests/fixtures/**/*.json
+!tests/fixtures/**/*.jsonl
+!scripts/experiments/**/*.json
+!scripts/experiments/**/*.jsonl
+!scripts/benchmark/*.json

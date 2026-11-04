@@ -1,0 +1,115 @@
+Subject: [PATCH 1/2] Optionally trace batched DeepGEMM MoE metadata
+
+Writes one JSON line per BatchedDeepGemmExperts call (expert token counts,
+M sizes, top-k) to $VLLM_DEEPGEMM_MOE_TRACE_PATH or $DEEPGEMM_MOE_TRACE_PATH;
+does nothing when neither is set.
+
+Upstream: vLLM, https://github.com/vllm-project/vllm (Apache License 2.0),
+base commit d4004455d2357985830af10e432709b42c820455; the modified file keeps
+its SPDX license header. Apply both with `git apply` on that commit.
+
+Provenance: 0001 and 0002, each read from its `diff --git` line on, are the two
+file diffs of the uncommitted change in the vLLM checkout the FastAFD alignment
+reference was built from; concatenated they are that change as one diff,
+sha256 899ee3acce35eee4da5c3ae57e5479782e3faa1173981786f1eafe27e5e303e3.
+---
+diff --git a/vllm/model_executor/layers/fused_moe/experts/batched_deep_gemm_moe.py b/vllm/model_executor/layers/fused_moe/experts/batched_deep_gemm_moe.py
+index 7bd383b9c..442ecefd9 100644
+--- a/vllm/model_executor/layers/fused_moe/experts/batched_deep_gemm_moe.py
++++ b/vllm/model_executor/layers/fused_moe/experts/batched_deep_gemm_moe.py
+@@ -1,6 +1,9 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
++import json
++import os
++import threading
+ 
+ import torch
+ 
+@@ -36,6 +39,68 @@ from vllm.utils.math_utils import cdiv, round_up
+ 
+ logger = init_logger(__name__)
+ 
++_MOE_TRACE_LOCK = threading.Lock()
++_MOE_TRACE_CALL_SEQ = 0
++
++
++def _trace_moe_metadata(
++    *,
++    layout: str,
++    expert_num_tokens: torch.Tensor,
++    expert_tokens_meta: mk.ExpertTokensMetadata | None,
++    expected_m: int,
++    storage_m: int,
++    top_k: int,
++    global_num_experts: int,
++    local_num_experts: int,
++) -> None:
++    path = os.environ.get("VLLM_DEEPGEMM_MOE_TRACE_PATH") or os.environ.get(
++        "DEEPGEMM_MOE_TRACE_PATH", ""
++    )
++    if not path:
++        return
++
++    global _MOE_TRACE_CALL_SEQ
++    with _MOE_TRACE_LOCK:
++        call_seq = _MOE_TRACE_CALL_SEQ
++        _MOE_TRACE_CALL_SEQ += 1
++        max_rows = int(os.environ.get("VLLM_DEEPGEMM_MOE_TRACE_MAX_ROWS", "0") or "0")
++        if max_rows > 0 and call_seq >= max_rows:
++            return
++
++    counts_tensor = (
++        expert_tokens_meta.expert_num_tokens_cpu
++        if expert_tokens_meta is not None and expert_tokens_meta.expert_num_tokens_cpu is not None
++        else expert_num_tokens
++    )
++    counts = counts_tensor.detach().to(device="cpu", dtype=torch.int32).tolist()
++    num_layers = int(
++        os.environ.get("DEEPGEMM_TRACE_NUM_LAYERS")
++        or os.environ.get("VLLM_DEEPGEMM_TRACE_NUM_LAYERS", "0")
++        or "0"
++    )
++    row = {
++        "backend": "vllm",
++        "pid": os.getpid(),
++        "cuda_device": torch.cuda.current_device() if torch.cuda.is_available() else None,
++        "call_seq": call_seq,
++        "derived_step": call_seq // num_layers if num_layers > 0 else None,
++        "derived_layer": call_seq % num_layers if num_layers > 0 else None,
++        "layout": layout,
++        "op": "moe_core",
++        "valid_m": int(sum(counts)),
++        "expected_m": int(expected_m),
++        "storage_m": int(storage_m),
++        "active_experts": int(sum(1 for count in counts if int(count) > 0)),
++        "expert_counts": [int(count) for count in counts],
++        "top_k": int(top_k),
++        "num_experts": int(global_num_experts),
++        "num_local_experts": int(local_num_experts),
++    }
++    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
++    with open(path, "a", encoding="utf-8") as handle:
++        handle.write(json.dumps(row, separators=(",", ":")) + "\n")
++
+ 
+ def scales_shape_stride_dtype(
+     E: int, T: int, G: int, quant_scale_fmt: DeepGemmQuantScaleFMT
+@@ -423,6 +488,16 @@ class BatchedDeepGemmExperts(mk.FusedMoEExpertsModular):
+             max_tokens_per_expert=max_num_tokens,
+             topk=topk_ids.size(-1),
+         )
++        _trace_moe_metadata(
++            layout="vllm_masked_grouped",
++            expert_num_tokens=expert_num_tokens,
++            expert_tokens_meta=expert_tokens_meta,
++            expected_m=expected_m,
++            storage_m=max_num_tokens,
++            top_k=topk_ids.size(-1),
++            global_num_experts=global_num_experts,
++            local_num_experts=E,
++        )
+ 
+         fp8_m_grouped_gemm_nt_masked(
+             (a1q, a1q_scale),

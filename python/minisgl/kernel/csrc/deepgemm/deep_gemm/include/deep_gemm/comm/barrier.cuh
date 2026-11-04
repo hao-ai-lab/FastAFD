@@ -5,6 +5,7 @@
 #include <deep_gemm/ptx/ld_st.cuh>
 #include <deep_gemm/layout/sym_buffer.cuh>
 #include <deep_gemm/layout/mega_moe.cuh>
+#include <deep_gemm/common/hang_guard.cuh>
 
 namespace deep_gemm::comm {
 
@@ -27,8 +28,11 @@ CUTLASS_DEVICE void grid_sync(const workspace_t& workspace,
         const auto old_value = ptx::atomic_add_rel(
             count_ptr, sm_idx == 0 ? (kFinishSumTag - (kNumSMs - 1)) : 1);
         uint32_t new_value;
+        const auto start_clock = clock64();
         do {
             new_value = ptx::ld_acq(count_ptr);
+            DG_HANG_GUARD(start_clock, "DG hang guard: grid_sync index=%u sm=%u old=%x now=%x ptr=%p\n",
+                          kGridSyncIndex, sm_idx, old_value, new_value, count_ptr);
         } while (((new_value ^ old_value) & kFinishSumTag) == 0);
     }
     sync_scope();

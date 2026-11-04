@@ -618,8 +618,9 @@ def fused_moe_fp8_triton(
     expert_map: torch.Tensor | None = None,
     global_num_experts: int | None = None,
     block_shape: tuple[int, int] = (128, 128),
+    config: dict[str, int] | None = None,
 ) -> torch.Tensor:
-    """Triton grouped FP8 MoE forward.
+    """Triton grouped FP8 MoE forward (``config``: Triton tile config; default as below).
 
     Adapted from vLLM `fused_experts_impl` keeping only the FP8 path; calls
     AFD's existing `moe_align_block_size`, `moe_sum_reduce_triton`, and
@@ -654,17 +655,18 @@ def fused_moe_fp8_triton(
     M = num_tokens
     Mt = M * top_k_num
 
-    try:
-        config = try_get_optimal_moe_config(
-            w1.shape,
-            w2.shape,
-            top_k_num,
-            M,
-            dtype="fp8_w8a8",
-            block_shape=block_shape,
-        )
-    except TypeError:
-        config = try_get_optimal_moe_config(w1.shape, w2.shape, top_k_num, M)
+    if config is None:
+        try:
+            config = try_get_optimal_moe_config(
+                w1.shape,
+                w2.shape,
+                top_k_num,
+                M,
+                dtype="fp8_w8a8",
+                block_shape=block_shape,
+            )
+        except TypeError:
+            config = try_get_optimal_moe_config(w1.shape, w2.shape, top_k_num, M)
 
     # Preallocate the four FP8-quant output buffers in one block, then thread
     # them into per_token_group_quant_fp8 via the out_q/out_s kwargs. vLLM does

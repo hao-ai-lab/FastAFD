@@ -7,6 +7,7 @@
 
 #include <concepts>
 #include <cstddef>
+#include <cstdlib>
 #include <source_location>
 #include <type_traits>
 
@@ -86,6 +87,25 @@ template <auto F> inline void set_smem_once(std::size_t smem_size) {
       smem_size <= last_smem_size,
       "Dynamic shared memory size exceeds the previously set maximum size: ",
       last_smem_size, " bytes");
+}
+
+// MINISGL_PDL=1: programmatic dependent launch. A kernel launched with it lets the next
+// kernel of its stream launch at once and waits (griddepcontrol.wait: the previous grid
+// complete, its writes visible) before reading anything, so consecutive kernels overlap
+// their launch and ramp. Both instructions are no-ops without the launch attribute.
+inline bool minisgl_pdl_enabled() {
+  static const bool on = [] {
+    const char *e = std::getenv("MINISGL_PDL");
+    return e != nullptr && e[0] == '1';
+  }();
+  return on;
+}
+
+__device__ __forceinline__ void minisgl_pdl_entry() {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+  asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+  asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif
 }
 
 struct LaunchKernel {

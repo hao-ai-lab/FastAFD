@@ -1,0 +1,2 @@
+# Blank context lines of a unified diff are a single space; they are part of the recorded patch bytes.
+*.patch -whitespace

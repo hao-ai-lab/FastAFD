@@ -64,6 +64,41 @@ def _is_glm4_moe_config(config: Any) -> bool:
     ) == "glm4_moe"
 
 
+def _is_qwen35_config(config: Any) -> bool:
+    archs = _config_field(config, "architectures", default=[]) or []
+    return (
+        "Qwen3_5MoeForConditionalGeneration" in archs
+        or _config_field(config, "model_type", default="")
+        in {"qwen3_5", "qwen3_5_moe", "qwen3_5_moe_text"}
+    )
+
+
+def _normalize_checkpoint_key(raw_name: str, config: Any) -> str | None:
+    """Map an HF checkpoint key to mini-sgl's text-model namespace.
+
+    Qwen3.5 wraps the language model below ``model.language_model``. Vision,
+    MTP, and static FP8-KV scale tensors are outside the text/BF16-KV runtime.
+    """
+
+    if raw_name.startswith(("vision_tower.", "multi_modal_projector.", "patch_merge_mlp.")):
+        return None
+    if _is_qwen35_config(config):
+        if raw_name.startswith(("model.visual.", "visual.", "mtp.", "model.mtp.")):
+            return None
+    if raw_name.endswith((".k_proj.k_scale", ".v_proj.v_scale")):
+        # Static FP8 KV scales: the KV pool stores BF16, and left in they would be
+        # swept into the qkv merge group and fail it as incomplete.
+        return None
+    if _is_qwen35_config(config):
+        if raw_name.startswith("model.language_model."):
+            raw_name = "model." + raw_name.removeprefix("model.language_model.")
+        elif raw_name.startswith("language_model."):
+            raw_name = raw_name.removeprefix("language_model.")
+    else:
+        raw_name = raw_name.removeprefix("language_model.")
+    return _rename_checkpoint_key(raw_name)
+
+
 def _glm4_layer_index_for_key(key: str) -> int | None:
     match = _GLM4_LAYER_PATTERN.match(key.removeprefix("language_model."))
     return int(match.group("idx")) if match is not None else None
@@ -85,6 +120,25 @@ def _scale_suffix_for_name(name: str) -> str | None:
     return None
 
 
+def cast_checkpoint_tensor(
+    key: str, value: torch.Tensor, dtype: torch.dtype, *, float32: bool = False
+) -> torch.Tensor:
+    """The dtype a loaded checkpoint tensor takes in the colocated engine.
+
+    Packed tensors (uint8, FP8) stay as stored. Quantization scales (`*_scale`) are
+    float32 whatever the checkpoint stores: the layers allocate them float32, and some
+    FP8 checkpoints (e.g. Qwen3-235B-A22B-Instruct-2507-FP8) ship bf16 block scales.
+    The AFD loader (afd_worker_base._cast_full) applies the same rule. `float32` marks
+    other tensors a model keeps in float32 (router weights, biases); the rest take
+    the model dtype.
+    """
+    if value.dtype in (torch.uint8, torch.float8_e4m3fn):
+        return value
+    if key.endswith("_scale") or float32:
+        return value.to(torch.float32)
+    return value.to(dtype)
+
+
 def _shard_tensor(
     key: str,
     value: torch.Tensor,
@@ -97,6 +151,16 @@ def _shard_tensor(
 ):
     """Extract rank r's shard from a single tensor. Returns a contiguous copy."""
     if skip_tp_shard:
+        return value
+    # Cross-head Q/K RMSNorm (MiniMax M2) carries one weight per head *element*, so it
+    # follows the head split; a per-head-shared norm (Qwen3, head_dim long) does not.
+    if value.dim() == 1 and key.endswith((".self_attn.q_norm.weight", ".self_attn.k_norm.weight")):
+        if value.numel() > 512 and n > 1:
+            if key.endswith(".k_norm.weight") and num_kv_heads is not None and num_kv_heads < n:
+                head_dim = value.numel() // num_kv_heads
+                head_idx = r * num_kv_heads // n
+                return value[head_idx * head_dim : (head_idx + 1) * head_dim].clone()
+            return value.chunk(n, dim=0)[r].clone()
         return value
     if fp8_block_size is not None and (
         key.endswith(".weight_scale") or key.endswith(_SCALE_RENAME_SUFFIX)
@@ -119,6 +183,92 @@ def _shard_tensor(
         return value[vocab_start_idx:vocab_end_idx, :].clone()
     else:
         return value
+
+
+def _shard_qwen35_linear_tensor(
+    key: str,
+    value: torch.Tensor,
+    r: int,
+    n: int,
+    config: Any,
+    *,
+    fp8_block_size: Optional[Tuple[int, int]] = None,
+) -> torch.Tensor | None:
+    """Shard Qwen3.5 GDN tensors whose names do not match generic QKV rules."""
+
+    marker = ".linear_attn."
+    if marker not in key:
+        return None
+    key_dim = int(config.linear_num_key_heads) * int(config.linear_key_head_dim)
+    value_dim = int(config.linear_num_value_heads) * int(
+        config.linear_value_head_dim
+    )
+
+    if key.endswith(".in_proj_qkv.weight_scale"):
+        if fp8_block_size is None:
+            return None
+        block_out = int(fp8_block_size[0])
+        if key_dim % block_out or value_dim % block_out:
+            raise ValueError(
+                "Qwen3.5 fused GDN FP8 scale requires block-aligned logical "
+                f"projections, got key={key_dim}, value={value_dim}, block={block_out}"
+            )
+        key_blocks = key_dim // block_out
+        value_blocks = value_dim // block_out
+        q, k, v = value.split((key_blocks, key_blocks, value_blocks), dim=0)
+        return torch.cat(
+            (
+                q.chunk(n, dim=0)[r],
+                k.chunk(n, dim=0)[r],
+                v.chunk(n, dim=0)[r],
+            ),
+            dim=0,
+        ).clone()
+    if key.endswith(
+        (
+            ".in_proj_z.weight_scale",
+            ".in_proj_a.weight_scale",
+            ".in_proj_b.weight_scale",
+        )
+    ):
+        if fp8_block_size is None:
+            return None
+        return _slice_fp8_scale_dim(
+            value,
+            dim=0,
+            r=r,
+            n=n,
+            block_size=int(fp8_block_size[0]),
+        )
+    if key.endswith(".out_proj.weight_scale"):
+        if fp8_block_size is None:
+            return None
+        return _slice_fp8_scale_dim(
+            value,
+            dim=1,
+            r=r,
+            n=n,
+            block_size=int(fp8_block_size[1]),
+        )
+    if key.endswith((".in_proj_qkv.weight", ".conv1d.weight")):
+        q, k, v = value.split((key_dim, key_dim, value_dim), dim=0)
+        return torch.cat(
+            (q.chunk(n, dim=0)[r], k.chunk(n, dim=0)[r], v.chunk(n, dim=0)[r]),
+            dim=0,
+        ).clone()
+    if key.endswith(
+        (
+            ".in_proj_z.weight",
+            ".in_proj_a.weight",
+            ".in_proj_b.weight",
+            ".A_log",
+            ".dt_bias",
+        )
+    ):
+        return value.chunk(n, dim=0)[r].clone()
+    if key.endswith(".out_proj.weight"):
+        return value.chunk(n, dim=1)[r].clone()
+    return None
 
 
 def _slice_fp8_scale_dim(
@@ -321,13 +471,11 @@ def load_weight(
         with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
             shard_keys = set(f.keys())
             for raw_name in f.keys():
-                # Strip multimodal wrapper prefix, skip vision/projector weights
-                if raw_name.startswith(("vision_tower.", "multi_modal_projector.")):
+                name = _normalize_checkpoint_key(raw_name, config)
+                if name is None:
                     continue
-                name = raw_name.removeprefix("language_model.")
                 if _is_glm4_moe_config(config) and _glm4_is_expected_nextn_key(name, config):
                     continue
-
                 scale_suffix = _scale_suffix_for_name(name)
                 is_scale_tensor = scale_suffix is not None
                 paired_scale_name = _find_paired_scale_key(
@@ -350,8 +498,6 @@ def load_weight(
                         if _is_expert_key(base_weight_name)
                         else base_weight_name + ".weight_scale"
                     )
-                name = _rename_checkpoint_key(name)
-
                 pre_merge_expert_info = (
                     _get_expert_stack_info(name) if config.is_moe else None
                 )
@@ -374,7 +520,21 @@ def load_weight(
                     ):
                         continue
                 raw = f.get_tensor(raw_name)
-                if fp8_channel_scale and is_scale_tensor:
+                qwen35_linear_tensor = (
+                    _shard_qwen35_linear_tensor(
+                        name,
+                        raw,
+                        tp_info.rank,
+                        tp_info.size,
+                        config,
+                        fp8_block_size=fp8_block_size,
+                    )
+                    if _is_qwen35_config(config)
+                    else None
+                )
+                if qwen35_linear_tensor is not None:
+                    tensor = qwen35_linear_tensor
+                elif fp8_channel_scale and is_scale_tensor:
                     tensor = _shard_fp8_channel_scale_tensor(
                         name,
                         raw,

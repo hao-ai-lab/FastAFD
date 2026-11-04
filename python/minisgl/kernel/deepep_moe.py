@@ -446,6 +446,14 @@ class DeepEPMoeElasticBuffer:
             129 if allow_hybrid_mode else 17
         )
         sl_idx = int(os.environ.get("EP_OVERRIDE_RDMA_SL", "3"))
+        # DeepEP spins on the GPU in every collective and traps after its timeout (sticky CUDA 719 at the next
+        # driver call). AFD attention ranks can reach their first dispatch minutes after the expert ranks
+        # (first-use FlashInfer / DeepGEMM JIT), so a DeepEP run can raise both timeouts by env.
+        # The GPU timeout is a JIT template argument: a non-default value compiles new kernel variants once.
+        cpu_timeout_secs = max(1, int(os.environ.get("MINISGL_DEEPEP_CPU_TIMEOUT_SECS", "120")))
+        gpu_timeout_secs = max(1, int(os.environ.get("MINISGL_DEEPEP_GPU_TIMEOUT_SECS", "120")))
+        self.cpu_timeout_secs = cpu_timeout_secs
+        self.gpu_timeout_secs = gpu_timeout_secs
         _log(
             "config "
             f"requested_max_tokens={self.requested_num_max_dispatch_tokens_per_rank} "
@@ -454,7 +462,8 @@ class DeepEPMoeElasticBuffer:
             f"deterministic={deterministic} allow_hybrid={allow_hybrid_mode} "
             f"allow_multi_reduce={allow_multiple_reduction} "
             f"prefer_overlap={self.prefer_overlap_with_compute} "
-            f"num_qps={self.num_allocated_qps} sl={sl_idx}"
+            f"num_qps={self.num_allocated_qps} sl={sl_idx} "
+            f"cpu_timeout_s={cpu_timeout_secs} gpu_timeout_s={gpu_timeout_secs}"
         )
         _log("nccl_handle_start")
         self._nccl_handle = _get_nccl_comm_handle(self._module, group)
@@ -487,8 +496,8 @@ class DeepEPMoeElasticBuffer:
             self.prefer_overlap_with_compute,
             sl_idx,
             self.num_allocated_qps,
-            120,
-            120,
+            cpu_timeout_secs,
+            gpu_timeout_secs,
             True,
         )
         _log("elastic_buffer_ctor_done")

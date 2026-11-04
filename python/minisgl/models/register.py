@@ -7,6 +7,10 @@ _MODEL_REGISTRY = {
     "Qwen2ForCausalLM": (".qwen2", "Qwen2ForCausalLM"),
     "Qwen3ForCausalLM": (".qwen3", "Qwen3ForCausalLM"),
     "Qwen3MoeForCausalLM": (".qwen3_moe", "Qwen3MoeForCausalLM"),
+    "Qwen3_5MoeForConditionalGeneration": (
+        ".qwen35_moe",
+        "Qwen3_5MoeForConditionalGeneration",
+    ),
     "MiniMaxM2ForCausalLM": (".minimax_m2", "MiniMaxM2ForCausalLM"),
     "Glm4MoeForCausalLM": (".glm4_moe", "Glm4MoeForCausalLM"),
     "MistralForCausalLM": (".mistral", "MistralForCausalLM"),

@@ -316,6 +316,14 @@ def m_grouped_fp8_gemm_nt_masked(*args, **kwargs):
     return _load_extension().m_grouped_fp8_gemm_nt_masked(*args, **kwargs)
 
 
+def fp8_mqa_logits(*args, **kwargs):
+    """``logits[i, j] = kv_sf[j] * sum_h weights[i, h] * relu(q[i, h] . kv[j])`` for
+    ``cu_seq_len_k_start[i] <= j < cu_seq_len_k_end[i]`` (-inf elsewhere with
+    ``clean_logits``): the lightning-indexer score. ``q [n, 32 | 64, d]`` e4m3,
+    ``kv = (e4m3 [nk, d], fp32 [nk])``, ``weights [n, heads]`` fp32."""
+    return _load_extension().fp8_mqa_logits(*args, **kwargs)
+
+
 bf16_m_grouped_gemm_nt_masked = m_grouped_bf16_gemm_nt_masked
 fp8_m_grouped_gemm_nt_masked = m_grouped_fp8_gemm_nt_masked
 
@@ -337,6 +345,7 @@ __all__ = [
     "m_grouped_fp8_gemm_nt_contiguous",
     "m_grouped_bf16_gemm_nt_masked",
     "m_grouped_fp8_gemm_nt_masked",
+    "fp8_mqa_logits",
     "bf16_m_grouped_gemm_nt_masked",
     "fp8_m_grouped_gemm_nt_masked",
 ]

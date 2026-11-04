@@ -38,6 +38,46 @@ class RMSNormFused(BaseOP):
         return x, residual
 
 
+class RMSNormOffset(RMSNorm):
+    """Gemma/Qwen3.5 RMSNorm with checkpoint multiplier ``1 + weight``.
+
+    The offset is folded once while loading so existing FlashInfer and fused
+    QK-norm kernels consume the effective multiplier without a per-token add.
+    """
+
+    def load_state_dict(self, state_dict, *, prefix="", _internal=False) -> None:
+        key = f"{prefix}.weight" if prefix else "weight"
+        item = state_dict.pop(key)
+        assert self.weight.shape == item.shape and self.weight.dtype == item.dtype
+        self.weight = item + 1
+        self._raw_weight = item   # vLLM's kernels take the raw weight and add 1 in fp32 (not stored state)
+        if not _internal and state_dict:
+            raise RuntimeError(f"Unexpected keys in state_dict: {list(state_dict.keys())}")
+
+    @property
+    def raw_weight(self):
+        """The checkpoint weight before the bf16 ``+ 1`` fold (None before load)."""
+        return getattr(self, "_raw_weight", None)
+
+
+class RMSNormOffsetFused(RMSNormFused):
+    """Residual-fused form of :class:`RMSNormOffset`."""
+
+    def load_state_dict(self, state_dict, *, prefix="", _internal=False) -> None:
+        key = f"{prefix}.weight" if prefix else "weight"
+        item = state_dict.pop(key)
+        assert self.weight.shape == item.shape and self.weight.dtype == item.dtype
+        self.weight = item + 1
+        self._raw_weight = item   # vLLM's kernels take the raw weight and add 1 in fp32 (not stored state)
+        if not _internal and state_dict:
+            raise RuntimeError(f"Unexpected keys in state_dict: {list(state_dict.keys())}")
+
+    @property
+    def raw_weight(self):
+        """The checkpoint weight before the bf16 ``+ 1`` fold (None before load)."""
+        return getattr(self, "_raw_weight", None)
+
+
 def _qk_variance(q: torch.Tensor, k: torch.Tensor):
     q = q.float()
     k = k.float()

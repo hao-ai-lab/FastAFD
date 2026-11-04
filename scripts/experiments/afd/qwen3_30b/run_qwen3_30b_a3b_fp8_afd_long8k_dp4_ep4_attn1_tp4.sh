@@ -21,6 +21,7 @@ AFD_MAX_NEW_TOKENS="${AFD_MAX_NEW_TOKENS:-$MAX_TOKENS}"
 SAMPLE_CONCURRENCY="${SAMPLE_CONCURRENCY:-$NUM_PROMPTS}"
 BATCH_SUBMIT="${BATCH_SUBMIT:-1}"
 IGNORE_EOS="${IGNORE_EOS:-1}"
+WARMUP_REPLAYS="${WARMUP_REPLAYS:-0}"
 
 ATTN_DP_SIZE="${ATTN_DP_SIZE:-1}"
 ATTN_TP_SIZE="${ATTN_TP_SIZE:-4}"
@@ -35,6 +36,9 @@ MINISGL_MAX_RUNNING_REQUESTS="${MINISGL_MAX_RUNNING_REQUESTS:-$NUM_PROMPTS}"
 MINISGL_CUDA_GRAPH_MAX_BS="${MINISGL_CUDA_GRAPH_MAX_BS:-256}"
 AFD_DECODE_GRAPH_BS="${AFD_DECODE_GRAPH_BS:-8,16,24,32,40,48,56,64,128,256}"
 AFD_NUM_MB="${AFD_NUM_MB:-2}"
+AFD_ASYNC_PENDING_STEPS="${AFD_ASYNC_PENDING_STEPS:-3}"
+AFD_FORCE_MULTI_MB_GRAPH_OVERLAP="${AFD_FORCE_MULTI_MB_GRAPH_OVERLAP:-0}"
+AFD_DISABLE_OVERLAP="${AFD_DISABLE_OVERLAP:-0}"
 AFD_MAX_BATCHED_TOKENS="${AFD_MAX_BATCHED_TOKENS:-32768}"
 MINISGL_MAX_SEQ_LEN="${MINISGL_MAX_SEQ_LEN:-8256}"
 MINISGL_PAGE_SIZE="${MINISGL_PAGE_SIZE:-64}"
@@ -62,8 +66,10 @@ NSYS="${NSYS:-0}"
 NSYS_CUDA_GRAPH_TRACE="${NSYS_CUDA_GRAPH_TRACE:-${MINISGL_RAY_NSYS_CUDA_GRAPH_TRACE:-graph}}"
 NSYS_START_STEP="${NSYS_START_STEP:-${MINISGL_RAY_NSYS_START_STEP:-0}}"
 NSYS_STOP_STEP="${NSYS_STOP_STEP:-${MINISGL_RAY_NSYS_STOP_STEP:-0}}"
-CLEAN_FIRST="${CLEAN_FIRST:-1}"
-CLEAN_AFTER="${CLEAN_AFTER:-1}"
+# Opt-in: kill_afd_ray_tasks.sh SIGKILLs matching processes on every live Ray
+# node, other people's jobs included. Set 1 only on a cluster you have to yourself.
+CLEAN_FIRST="${CLEAN_FIRST:-0}"
+CLEAN_AFTER="${CLEAN_AFTER:-0}"
 WAIT_READY_TIMEOUT="${WAIT_READY_TIMEOUT:-1800}"
 SAMPLE_TIMEOUT="${SAMPLE_TIMEOUT:-3600}"
 POST_SHUTDOWN_SLEEP="${POST_SHUTDOWN_SLEEP:-20}"
@@ -89,9 +95,11 @@ if [[ "$RUN_DIR" != /* ]]; then
 fi
 PROMPT_FILE="${PROMPT_FILE:-$RUN_DIR/prompts_${NUM_PROMPTS}x${PROMPT_LEN}.txt}"
 SAMPLE_JSON="$RUN_DIR/sample.json"
+WARMUP_JSON="$RUN_DIR/warmup.json"
 ALIGNMENT_JSON="$RUN_DIR/alignment.json"
 AFD_LOG="$RUN_DIR/afd.log"
 SAMPLE_LOG="$RUN_DIR/sample.log"
+WARMUP_LOG="$RUN_DIR/warmup.log"
 VLLM_LOG="$RUN_DIR/vllm.log"
 SCORE_LOG="$RUN_DIR/score.log"
 RAY_LOG_DIR="$RUN_DIR/ray_logs"
@@ -251,6 +259,7 @@ echo "  prompt_len: $PROMPT_LEN"
 echo "  num_prompts: $NUM_PROMPTS"
 echo "  max_tokens: $MAX_TOKENS"
 echo "  afd_max_new_tokens: $AFD_MAX_NEW_TOKENS"
+echo "  warmup_replays: $WARMUP_REPLAYS"
 echo "  sample_concurrency: $SAMPLE_CONCURRENCY"
 echo "  batch_submit: $BATCH_SUBMIT"
 echo "  ignore_eos: $IGNORE_EOS"
@@ -258,6 +267,9 @@ echo "  attn_dp/tp: $ATTN_DP_SIZE/$ATTN_TP_SIZE"
 echo "  mlp_dp/tp/ep: $MLP_DP_SIZE/$MLP_TP_SIZE/$AFD_MLP_EP_SIZE"
 echo "  graph_bs: $AFD_DECODE_GRAPH_BS"
 echo "  afd_num_mb: $AFD_NUM_MB"
+echo "  afd_async_pending_steps: $AFD_ASYNC_PENDING_STEPS"
+echo "  afd_force_multi_mb_graph_overlap: $AFD_FORCE_MULTI_MB_GRAPH_OVERLAP"
+echo "  afd_disable_overlap: $AFD_DISABLE_OVERLAP"
 echo "  max_batched_tokens: $AFD_MAX_BATCHED_TOKENS"
 echo "  max_comm_tokens: ${MINISGL_AFD_MAX_COMM_TOKENS:-<auto>}"
 echo "  deepep_cpu_sync_disabled: ${MINISGL_AFD_DISABLE_DEEPEP_CPU_SYNC:-0}"
@@ -331,10 +343,17 @@ start_cmd=(
   --cuda-graph-max-bs "$MINISGL_CUDA_GRAPH_MAX_BS"
   --afd-decode-graph-bs "$AFD_DECODE_GRAPH_BS"
   --afd-num-mb "$AFD_NUM_MB"
+  --afd-async-pending-steps "$AFD_ASYNC_PENDING_STEPS"
   --afd-device-comm-num-sms "$AFD_DEVICE_COMM_NUM_SMS"
   --max-seq-len-override "$MINISGL_MAX_SEQ_LEN"
   --extra-args "$AFD_SERVER_EXTRA_ARGS"
 )
+if [[ "$AFD_FORCE_MULTI_MB_GRAPH_OVERLAP" == "1" ]]; then
+  start_cmd+=(--afd-force-multi-mb-graph-overlap)
+fi
+if [[ "$AFD_DISABLE_OVERLAP" == "1" ]]; then
+  start_cmd+=(--afd-disable-overlap)
+fi
 if [[ "$NSYS" == "1" ]]; then
   export MINISGL_RAY_NSYS_CUDA_GRAPH_TRACE="$NSYS_CUDA_GRAPH_TRACE"
   export MINISGL_RAY_NSYS_START_STEP="$NSYS_START_STEP"
@@ -363,6 +382,34 @@ until curl -fsS "http://${SERVER_HOST}:${MINISGL_PORT}/v1/models" >/dev/null 2>&
 done
 echo "AFD ready: http://${SERVER_HOST}:${MINISGL_PORT}"
 
+if (( WARMUP_REPLAYS < 0 || WARMUP_REPLAYS + 1 > AFD_MAX_NEW_TOKENS )); then
+  echo "WARMUP_REPLAYS=$WARMUP_REPLAYS must be >= 0 and warmup tokens must fit AFD_MAX_NEW_TOKENS=$AFD_MAX_NEW_TOKENS" >&2
+  exit 1
+fi
+if (( WARMUP_REPLAYS > 0 )); then
+  warmup_cmd=(
+    python "$SCRIPT_ROOT/validate/compare_minisgl_vllm.py" sample
+    --model "$MODEL_PATH"
+    --minisgl-url "http://${SERVER_HOST}:${MINISGL_PORT}"
+    --prompt-file "$PROMPT_FILE"
+    --prompt-repeat 1
+    --max-tokens "$((WARMUP_REPLAYS + 1))"
+    --temperature 0
+    --top-p 1
+    --top-k 1
+    --sample-concurrency "$SAMPLE_CONCURRENCY"
+    --timeout "$SAMPLE_TIMEOUT"
+    --sample-json "$WARMUP_JSON"
+  )
+  if [[ "$BATCH_SUBMIT" == "1" ]]; then
+    warmup_cmd+=(--batch-submit)
+  fi
+  if [[ "$IGNORE_EOS" == "1" ]]; then
+    warmup_cmd+=(--ignore-eos)
+  fi
+  "${warmup_cmd[@]}" >"$WARMUP_LOG" 2>&1
+fi
+
 sample_cmd=(
   python "$SCRIPT_ROOT/validate/compare_minisgl_vllm.py" sample
   --model "$MODEL_PATH"
@@ -389,7 +436,9 @@ stop_process_tree "$AFD_PID" "$AFD_STOP_TIMEOUT_S" || true
 wait "$AFD_PID" >/dev/null 2>&1 || true
 AFD_PID=""
 sleep "$POST_SHUTDOWN_SLEEP"
-if [[ "$RUN_VLLM_ALIGNMENT" == "1" || "$CLEAN_AFTER" == "1" ]]; then
+# kill_afd_ray_tasks.sh SIGKILLs matching processes of every user on every Ray node;
+# on the shared cluster run it only when explicitly asked (CLEAN_AFTER=1).
+if [[ "$CLEAN_AFTER" == "1" ]]; then
   "$SCRIPT_ROOT/kill_afd_ray_tasks.sh" >/dev/null 2>&1 || true
 fi
 

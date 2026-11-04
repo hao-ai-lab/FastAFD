@@ -17,7 +17,8 @@ from minisgl.distributed import destroy_distributed
 from minisgl.engine.config import EngineConfig
 from minisgl.engine.engine import _adjust_config, _init_tp_communication
 from minisgl.engine.graph import get_free_memory, mem_GB
-from minisgl.kvcache import create_kvcache_pool
+from minisgl.kvcache import create_hybrid_gdn_state_pool, create_kvcache_pool
+from minisgl.kernel.vllm_state_index import check_slot_range, state_index_dtype
 from minisgl.utils import div_even, init_logger, nvtx_label, nvtx_range
 
 from .afd_attention_runtime import AfdAttentionRuntime
@@ -75,6 +76,20 @@ class AfdAttentionState:
         self.tp_cpu_group = _init_tp_communication(config, self.dtype)
         free_memory = self._sync_get_memory()[1]
 
+        check_slot_range(config.max_running_req + 1)   # int32 GDN slot ids under MINISGL_QWEN35_VLLM_KERNELS
+        self.ctx.gdn_state_pool = create_hybrid_gdn_state_pool(
+            config.model_config,
+            max_slots=config.max_running_req + 1,
+            dtype=self.dtype,
+            device=self.device,
+        )
+        if self.ctx.gdn_state_pool is not None:
+            logger.info_rank0(
+                "AFD allocated hybrid GDN state: layers=%d slots=%d bytes_per_slot=%d",
+                len(self.ctx.gdn_state_pool.layer_ids),
+                self.ctx.gdn_state_pool.max_slots,
+                self.ctx.gdn_state_pool.bytes_per_slot,
+            )
         self.num_pages = self._determine_num_pages(free_memory, config)
         self.max_seq_len = min(config.max_seq_len, self.num_pages * config.page_size)
         aligned_max_seq_len = ((self.max_seq_len + 31) // 32) * 32
@@ -127,15 +142,40 @@ class AfdAttentionState:
         return min_free_memory, max_free_memory
 
     def _determine_num_pages(self, old_free_memory: int, config: EngineConfig) -> int:
-        cache_per_page = (
+        new_free_memory = self._sync_get_memory()[1]
+        bytes_per_page_per_layer = (
             2
             * config.model_config.head_dim
             * div_even(config.model_config.num_kv_heads, config.tp_info.size, allow_replicate=True)
             * config.page_size
             * self.dtype.itemsize
-            * config.model_config.num_layers
         )
-        available_memory = int(config.memory_ratio * old_free_memory)
+        # Must match what the pool allocates: every layer that keeps KV.
+        cache_per_page = bytes_per_page_per_layer * len(config.model_config.kv_cache_layer_ids)
+        # Speculative decoding: the draft's KV is indexed by the same pages, and each
+        # request row holds the target feature of its last prefill position.
+        from .spec.config import afd_spec_config
+        from .spec.attn_side import draft_kv_bytes_per_token, draft_ring_bytes
+
+        spec = afd_spec_config()
+        draft_bytes_per_page = draft_kv_bytes_per_token(spec) * config.page_size
+        cache_per_page += draft_bytes_per_page
+        draft_ring = 0
+        if spec.enabled:
+            draft_ring = draft_ring_bytes(spec, int(config.max_running_req) + 1, int(config.max_seq_len))
+        if draft_ring:
+            logger.info(
+                "AFD spec draft: paged KV %d B/token, pending features %s for %d rows",
+                draft_kv_bytes_per_token(spec), mem_GB(draft_ring), int(config.max_running_req) + 1,
+            )
+        state_memory = old_free_memory - new_free_memory
+        available_memory = int(config.memory_ratio * old_free_memory) - state_memory - draft_ring
+        if available_memory <= 0:
+            raise RuntimeError(
+                f"the draft's per-row state ({mem_GB(draft_ring)}) fills the "
+                f"{mem_GB(int(config.memory_ratio * old_free_memory))} budget, leaving "
+                "nothing for KV. Lower max_running_req."
+            )
         memory_cap = available_memory // cache_per_page
         requested = config.num_page_override
         if requested is None:
@@ -311,6 +351,9 @@ class AfdAgDecodeGraphRunner:
         self._input_ids = torch.zeros((self.max_bs,), dtype=torch.int32, device=self.device)
         self._positions = torch.zeros((self.max_bs,), dtype=torch.int32, device=self.device)
         self._out_loc = torch.zeros((self.max_bs,), dtype=torch.int32, device=self.device)
+        self._state_indices = torch.zeros(
+            (self.max_bs,), dtype=state_index_dtype(), device=self.device   # int32 under MINISGL_QWEN35_VLLM_KERNELS (vLLM's dtype)
+        )
         self._final_out = torch.empty(
             (self.max_bs, self.hidden_size), dtype=torch.bfloat16, device=self.device
         )
@@ -327,6 +370,9 @@ class AfdAgDecodeGraphRunner:
             for _ in range(self.num_layers)
         ]
         self._mb_capture_initialized: set[int] = set()
+        self.lane_compute_streams: tuple[torch.cuda.Stream, ...] = ()
+        if self.num_mb > 1 and os.environ.get("MINISGL_AFD_LANE_COMPUTE_STREAMS") == "1":
+            self.lane_compute_streams = tuple(torch.cuda.Stream(device=self.device) for _ in range(self.num_mb))
 
     def has_bucket(self, bs: int) -> bool:
         return int(bs) in self.graphs
@@ -338,6 +384,7 @@ class AfdAgDecodeGraphRunner:
         batch.input_ids = self._input_ids[:bs]
         batch.positions = self._positions[:bs]
         batch.out_loc = self._out_loc[:bs]
+        batch.state_indices = self._state_indices[:bs]
         return batch
 
     def warmup(self, bs: int) -> None:
@@ -365,6 +412,8 @@ class AfdAgDecodeGraphRunner:
         out_buf = self._final_out[:bs]
         is_megamoe_backend = getattr(adapter, "backend", "deepep") == "megamoe_m2n"
 
+        dispatch_bucket = bs
+
         def _fn() -> None:
             with ctx.forward_batch(capture_batch):
                 state = model.embed_input_ids(capture_batch.input_ids)
@@ -385,6 +434,7 @@ class AfdAgDecodeGraphRunner:
                             external_quant=bool(
                                 getattr(topk, "external_quant", False)
                             ),
+                            layer=layer,
                         )
                         hidden = afd_moe_output(hidden, topk)
                         continue
@@ -395,13 +445,13 @@ class AfdAgDecodeGraphRunner:
                         topk.topk_ids,
                         topk.topk_weights,
                         hidden_states_scale=disp_scale,
-                        num_max_dispatch_tokens_per_rank=bs,
+                        num_max_dispatch_tokens_per_rank=dispatch_bucket,
                         router_logits=topk.router_logits,
                         renormalize=topk.renormalize,
                         topk_ids_are_deepep=topk.deepep_topk,
                     )
-                    hidden = adapter.combine(ag_combine_input(disp.hidden_states), disp)
-                    hidden = afd_moe_output(hidden, topk)
+                    routed_output = adapter.combine(ag_combine_input(disp.hidden_states), disp)
+                    hidden = afd_moe_output(routed_output, topk)
                 final = model.finalize_hidden(hidden, residual)
                 out_buf.copy_(final)
 
@@ -465,6 +515,7 @@ class AfdAgDecodeGraphRunner:
             sub.input_ids = self._input_ids[s:e]
             sub.positions = self._positions[s:e]
             sub.out_loc = self._out_loc[s:e]
+            sub.state_indices = self._state_indices[s:e]
             backend.prepare_for_capture(sub)
             subs.append(sub)
         whole.attn_metadata = subs[0].attn_metadata  # embed ignores it
@@ -477,7 +528,10 @@ class AfdAgDecodeGraphRunner:
             with ctx.forward_batch(whole):
                 embed_state = model.embed_input_ids(whole.input_ids)
             hidden_full = embed_state.hidden_states
-            hidden = [hidden_full[mb * mb_bs:(mb + 1) * mb_bs] for mb in range(num_mb)]
+            hidden = [
+                hidden_full[mb * mb_bs:(mb + 1) * mb_bs]
+                for mb in range(num_mb)
+            ]
             state = _AfdAgMbState(
                 num_mb=num_mb,
                 bucket=mb_bs,
@@ -497,6 +551,7 @@ class AfdAgDecodeGraphRunner:
                 retired=[],
                 skip_marker=object(),
                 use_megamoe=getattr(adapters[0], "backend", "deepep") == "megamoe_m2n",
+                compute_streams=self.lane_compute_streams or None,
             )
             with nvtx_range("AFD_AG_Graph_PipelineMB"):
                 _run_ag_pipeline_body(
@@ -522,13 +577,13 @@ class AfdAgDecodeGraphRunner:
         with torch.cuda.stream(engine_stream):
             _fn()
         engine_stream.synchronize()
-        for stream in lane_streams:
+        for stream in lane_streams + self.lane_compute_streams:
             stream.synchronize()
         graph, self._pool = capture_cuda_graph(
             device=self.device,
             engine_stream=engine_stream,
             comm_stream=comm_stream,
-            extra_streams=lane_streams,
+            extra_streams=tuple(lane_streams) + self.lane_compute_streams,
             overlap_comm=True,
             pool=self._pool,
             fn=_fn,
@@ -552,6 +607,7 @@ class AfdAgDecodeGraphRunner:
             self._input_ids[:bs].copy_(batch.input_ids[:bs])
             self._positions[:bs].copy_(batch.positions[:bs])
             self._out_loc[:bs].copy_(batch.out_loc[:bs])
+            self._state_indices[:bs].copy_(batch.state_indices[:bs])
             for mb in range(num_mb):
                 cap_sub = buf.sub_batches[mb]
                 cap_sub.reqs = real_subs[mb].reqs
@@ -576,6 +632,7 @@ class AfdAgDecodeGraphRunner:
             self._input_ids[:bs].copy_(batch.input_ids[:bs])
             self._positions[:bs].copy_(batch.positions[:bs])
             self._out_loc[:bs].copy_(batch.out_loc[:bs])
+            self._state_indices[:bs].copy_(batch.state_indices[:bs])
             cap = buf.capture_batch
             cap.reqs = batch.reqs
             cap.padded_reqs = batch.padded_reqs
@@ -601,6 +658,14 @@ class _AfdAgInFlight:
     sent_ns: int
     next_tokens_cpu: torch.Tensor  # pinned/host tensor, copy in flight on d2h stream
     copy_done: torch.cuda.Event
+    # Speculative verify: (table_idx, cached_len) per reply row, applied on the host
+    # once the reply (which carries each row's accepted count) has landed.
+    spec_cached: list | None = None
+    spec_real_slots: list | None = None
+    # Device-input mode (spec.device_inputs): each row's SpecLengths generation, and the slot count
+    # when the reply carries the committed-length tail after its packed rows.
+    spec_gens: list | None = None
+    spec_tail_slots: int = 0
 
 
 @dataclass
@@ -619,6 +684,13 @@ class _AfdAgMbState:
     retired: list[tuple[torch.cuda.Event, Any, Any]]
     skip_marker: object
     use_megamoe: bool
+    # Speculative decoding: decoder layer -> column block of features[mb] that
+    # receives that layer's output (the draft's conditioning hidden states).
+    capture_cols: dict[int, int] | None = None
+    features: list[torch.Tensor] | None = None
+    # MINISGL_AFD_LANE_COMPUTE_STREAMS=1: one compute stream per microbatch instead of the shared
+    # engine stream, so one lane's dense GEMMs / small kernels can run beside the other lane's attention
+    compute_streams: tuple[torch.cuda.Stream, ...] | None = None
 
 
 def _record_stream(tensor, stream: torch.cuda.Stream) -> None:
@@ -650,6 +722,19 @@ def _run_ag_pipeline_body(
     num_layers = int(num_layers)
     graph_live_tensors: list[torch.Tensor] = []
     graph_live_objects: list[Any] = []
+    # MINISGL_AFD_ROUTE_ON_LANE=1 (MegaMoE): the router runs on the lane stream in
+    # front of the AG kernel instead of on the engine stream, so the engine stream
+    # goes straight on to the other microbatch's attention while it runs. Only for
+    # models whose route() is local to the rank (afd_route_is_local: no TP collective,
+    # shared expert or dense layer inside it).
+    # Use it with MINISGL_MEGAMOE_AG_SPLIT=waitvalue: with the fused AG kernel, which
+    # holds its SMs through the round trip, the later AG launch lands its CTAs unevenly
+    # over the GPCs and the other lane's attention clusters no longer fit in one wave
+    # (MiniMax 64K 1:1: 28.85 -> 32.67 ms; with waitvalue, Qwen 128K 31.28 -> 29.93 ms).
+    route_on_lane = os.environ.get("MINISGL_AFD_ROUTE_ON_LANE") == "1"
+    if route_on_lane and not (state.use_megamoe and getattr(model, "afd_route_is_local", False)):
+        raise ValueError("MINISGL_AFD_ROUTE_ON_LANE=1 needs MegaMoE and a model whose route() is "
+                         f"local to the rank ({type(model).__name__})")
 
     def retain_tensors(*items) -> None:
         if not (retain_graph_objects and torch.cuda.is_current_stream_capturing()):
@@ -672,15 +757,41 @@ def _run_ag_pipeline_body(
                 keep.append((event, disp_obj, topk_obj))
         state.retired[:] = keep
 
+    def capture(layer: int, mb: int) -> None:
+        # Decoder layer output = MoE output + residual, before the next layer's
+        # fused add+norm consumes them. Runs on the engine stream after combine.
+        col = state.capture_cols.get(layer) if state.capture_cols else None
+        if col is None:
+            return
+        width = state.hidden[mb].shape[-1]
+        out = state.features[mb][:, col * width : (col + 1) * width]
+        torch.add(state.hidden[mb], state.residual[mb], out=out)
+
+    def route(layer: int, mb: int):
+        # the fused router writes the MegaMoE input buffers for every row it routes
+        if state.use_megamoe and hasattr(model, "route_for_megamoe"):
+            adapter_mb = adapters[mb % len(adapters)]
+            topk = model.route_for_megamoe(
+                layer,
+                state.hidden[mb],
+                adapter_mb,
+                lane=mb,
+            )
+        else:
+            topk = model.route(layer, state.hidden[mb])
+        return topk
+
     def launch_compute(layer: int, mb: int):
         ready_event = state.ready_events[layer][mb]
         prev_backend = ctx.attn_backend
         ctx.attn_backend = state.backends[mb]
+        compute_stream = state.compute_streams[mb] if state.compute_streams else engine_stream
         try:
             with ctx.forward_batch(state.subs[mb]):
-                with torch.cuda.stream(engine_stream):
+                with torch.cuda.stream(compute_stream):
                     if layer > 0:
-                        engine_stream.wait_event(state.done_events[layer - 1][mb])
+                        compute_stream.wait_event(state.done_events[layer - 1][mb])
+                        capture(layer - 1, mb)
                     st = model.forward_attention(
                         layer, state.hidden[mb], state.residual[mb]
                     )
@@ -688,16 +799,10 @@ def _run_ag_pipeline_body(
                         st.hidden_states,
                         st.residual,
                     )
-                    if state.use_megamoe and hasattr(model, "route_for_megamoe"):
-                        adapter_mb = adapters[mb % len(adapters)]
-                        topk = model.route_for_megamoe(
-                            layer,
-                            state.hidden[mb],
-                            adapter_mb,
-                            lane=mb,
-                        )
-                    else:
-                        topk = model.route(layer, state.hidden[mb])
+                    if route_on_lane:
+                        ready_event.record(compute_stream)
+                        return None, None, None
+                    topk = route(layer, mb)
                     if state.use_megamoe or bool(getattr(topk, "skip_moe", False)):
                         disp_x, disp_scale = None, None
                     else:
@@ -707,11 +812,8 @@ def _run_ag_pipeline_body(
                             topk,
                             state.hidden[mb],
                         )
-                        disp_x, disp_scale = afd_dispatch_payload(
-                            state.hidden[mb],
-                            topk,
-                        )
-                    ready_event.record(engine_stream)
+                        disp_x, disp_scale = afd_dispatch_payload(state.hidden[mb], topk)
+                    ready_event.record(compute_stream)
         finally:
             ctx.attn_backend = prev_backend
         retain_tensors(
@@ -728,6 +830,18 @@ def _run_ag_pipeline_body(
     def launch_dispatch(layer: int, mb: int, packet) -> None:
         disp_x, disp_scale, topk = packet
         comm_stream = state.lane_streams[mb % len(state.lane_streams)]
+        if route_on_lane:
+            _record_stream(state.hidden[mb], comm_stream)
+            with torch.cuda.stream(comm_stream):
+                comm_stream.wait_event(state.ready_events[layer][mb])
+                topk = route(layer, mb)
+            retain_tensors(
+                getattr(topk, "topk_ids", None),
+                getattr(topk, "topk_weights", None),
+                getattr(topk, "router_logits", None),
+                getattr(topk, "shared_output", None),
+                getattr(topk, "local_output", None),
+            )
         if bool(getattr(topk, "skip_moe", False)):
             state.hidden[mb] = afd_moe_output(state.hidden[mb], topk)
             with torch.cuda.stream(comm_stream):
@@ -748,6 +862,7 @@ def _run_ag_pipeline_body(
                     topk.topk_weights,
                     lane=mb,
                     external_quant=bool(getattr(topk, "external_quant", False)),
+                    layer=layer,
                 )
                 state.hidden[mb] = afd_moe_output(state.hidden[mb], topk)
             state.dispatches[layer][mb] = ()
@@ -793,11 +908,11 @@ def _run_ag_pipeline_body(
         adapter_mb = adapters[mb % len(adapters)]
         topk = state.route_topks[layer][mb]
         with torch.cuda.stream(comm_stream):
-            state.hidden[mb] = adapter_mb.combine(
+            routed_output = adapter_mb.combine(
                 ag_combine_input(disp.hidden_states),
                 disp,
             )
-            state.hidden[mb] = afd_moe_output(state.hidden[mb], topk)
+            state.hidden[mb] = afd_moe_output(routed_output, topk)
             state.done_events[layer][mb].record(comm_stream)
         if retire_async_objects:
             state.retired.append((state.done_events[layer][mb], disp, topk))
@@ -807,6 +922,10 @@ def _run_ag_pipeline_body(
             retain_objects(disp, topk)
         state.dispatches[layer][mb] = None
         state.route_topks[layer][mb] = None
+
+    if state.compute_streams:
+        for stream in state.compute_streams:
+            stream.wait_stream(engine_stream)
 
     # AG collective order:
     #   compute+D(L0, mb0), compute+D(L0, mb1), ...
@@ -827,8 +946,13 @@ def _run_ag_pipeline_body(
                 retire()
     if retire_async_objects:
         retire(force=True)
+    if state.compute_streams:
+        for stream in state.compute_streams:
+            engine_stream.wait_stream(stream)
     for mb in range(state.num_mb):
         engine_stream.wait_event(state.done_events[num_layers - 1][mb])
+        with torch.cuda.stream(engine_stream):
+            capture(num_layers - 1, mb)
 
 
 class AfdAttentionWorker(BaseAfdWorker):
@@ -842,8 +966,15 @@ class AfdAttentionWorker(BaseAfdWorker):
     # BaseAfdWorker hooks
     # ------------------------------------------------------------------
 
+    def _create_attention_state(self, config: AfdRuntimeConfig) -> AfdAttentionState:
+        return AfdAttentionState(config)
+
     def _create_runtime(self, config: AfdRuntimeConfig):
-        return AfdAttentionRuntime(config, AfdAttentionState(config))
+        runtime = AfdAttentionRuntime(config, self._create_attention_state(config))
+        # The runtime's audit trace needs the per-rank log file; the driver log
+        # dedupes repeated lines and loses most of it.
+        runtime.audit_log_path = self.log_path
+        return runtime
 
     def _run_hot_rpc_loop(self) -> None:
         """Drive the hot loop until an AfdStopCmd is received."""
@@ -873,19 +1004,22 @@ class AfdAttentionWorker(BaseAfdWorker):
                         self._run_afd_ag_step(cmd.plan, sent_ns=cmd.sent_ns)
                     )
                     continue
+                if self._handle_cad_cmd(cmd):
+                    continue
                 raise RuntimeError(
                     f"Unsupported centralized attention command: {type(cmd).__name__}"
                 )
 
     def centralized_overlap_loop(self) -> None:
-        # Fixed two-step-ahead AG: launch two future commands before retiring the
-        # oldest reply handle. This lets cudaGraphLaunch for N+2 enqueue before
-        # the CPU waits on N's D2H copy event. AfdFlushStepCmd is the explicit
-        # pipeline-drain marker at generation end.
+        # Launch a finite future-command window before retiring the oldest reply
+        # handle. With the default pending window 3, cudaGraphLaunch for N+2
+        # enqueues before the CPU waits on N's D2H copy event.
         pending_afd_ag: deque[_AfdAgInFlight] = deque()
 
         def retire_afd_ag(force: bool = False) -> None:
-            while pending_afd_ag and (force or len(pending_afd_ag) > 2):
+            while pending_afd_ag and (
+                force or len(pending_afd_ag) > self.async_retire_depth
+            ):
                 self._process_last_afd_ag(pending_afd_ag.popleft())
 
         while True:
@@ -906,14 +1040,135 @@ class AfdAttentionWorker(BaseAfdWorker):
                     self.handle_profiler_cmd(cmd)
                     continue
                 if isinstance(cmd, AfdRunAGStepCmd):
+                    if getattr(self, "_afd_spec", None) is not None and not self._spec_step_runs_ahead(cmd.plan):
+                        # A verify step starts from the committed lengths of the
+                        # previous one, which the host learns from its reply; the
+                        # coordinator has already queued this plan, so only the
+                        # GPU drain is exposed, not the coordinator round trip.
+                        retire_afd_ag(force=True)
                     pending_afd_ag.append(
                         self._run_afd_ag_step(cmd.plan, sent_ns=cmd.sent_ns)
                     )
                     retire_afd_ag()
                     continue
+                if self._is_cad_cmd(cmd):
+                    retire_afd_ag(force=True)  # the earlier AFD steps' replies first: a CAD step is synchronous
+                    self._handle_cad_cmd(cmd)
+                    continue
                 raise RuntimeError(
                     f"Unsupported centralized attention command: {type(cmd).__name__}"
                 )
+
+    # ------------------------------------------------------------------
+    # CAD decode (minisgl.cad, MINISGL_AFD_MODE=cad): this GPU runs only
+    # the core attention of every decode layer (cad/attn_side.py); the AG stage stays loaded for the AFD prefill steps.
+    # ------------------------------------------------------------------
+
+    def _cad_ranks(self):
+        from minisgl.cad.groups import CadRanks
+
+        topo = self._topology
+        return CadRanks(rank=int(self.worker_rank), num_attn=int(topo.total_attn_workers),
+                        num_model=int(topo.mlp_world_size))
+
+    def _init_cad(self, cmd) -> None:
+        """AfdCadInitCmd: collective in cad/groups.py's order: the CAD groups, the window over the union
+        world, then (the model ranks build their dual-role MegaMoE) every rank's runtime warm-up (cad/runtime.py)."""
+        import torch.distributed as dist
+
+        from minisgl.attention.trtllm import TensorRTLLMBackend
+        from minisgl.cad.attn_side import AttnDims, CadAttnTasks, TrtllmCadMeta, trtllm_decode_into
+        from minisgl.cad.config import CadConfig
+        from minisgl.cad.groups import cad_groups
+        from minisgl.cad.layout import CadLayout
+        from minisgl.cad.program import program
+        from minisgl.cad.runtime import CadNodeRuntime, TorchCadBackend
+        from minisgl.cad.window import CadWindow
+        from minisgl.kernel import cad_hop
+
+        from .afd_protocol import AfdCadReadyReply
+
+        cfg = CadConfig.from_env()
+        if not cfg.enabled:
+            raise RuntimeError("AfdCadInitCmd without MINISGL_AFD_MODE=cad")
+        ranks = self._cad_ranks()
+        if ranks.role != "attn" or int(self.attn_tp_size) != 1:
+            raise RuntimeError(f"CAD attention side: rank {ranks.rank} role {ranks.role}, attention TP {self.attn_tp_size} "
+                               "(CAD v1 runs attention TP1)")
+        state = self.runtime_state
+        mc = state.config.model_config
+        L, m, t_max = int(mc.num_layers), int(cmd.num_mb), int(cmd.t_max)
+        dims = AttnDims(int(mc.num_qo_heads), int(mc.num_kv_heads), int(mc.head_dim))
+        lay = CadLayout.for_model(num_layers=L, num_mb=m, r=ranks.r, t_max=t_max, q_heads=dims.q_heads,
+                                  kv_heads=dims.kv_heads, head_dim=dims.head_dim)
+        tag = f"[cad-attn{ranks.rank}] init:"   # the coordinator's CAD-init watchdog names each rank's last stage from these
+
+        # the same collective order as the model ranks up to the window (cad/model_worker.py: no symm_mem rendezvous on
+        # any group before the WORLD window, since torch keys every rendezvous by one per-process sequence number)
+        log_line(self.log_path, f"{tag} groups (dist.new_group over the default group)", flush=True)
+        _model_group, window_group = cad_groups(dist, ranks)
+        log_line(self.log_path, f"{tag} window (symm_mem rendezvous + barrier over WORLD)", flush=True)
+        win = CadWindow.allocate(lay, "attn", ranks.rank, ranks.peers, window_group, state.device, cfg.timeout_ns,
+                                 peer_j=ranks.peer_j)
+        log_line(self.log_path, f"{tag} FMHA metadata + tasks (no collective)", flush=True)
+        backends = [TensorRTLLMBackend(mc) for _ in range(m)]   # CAD's own per-mb capture buffers (attn_side.py)
+        page = int(state.config.page_size)
+        meta = TrtllmCadMeta(backends=backends, num_mb=m, t_max=t_max, buckets=list(cmd.buckets),
+                             max_seq_len=int(state.max_seq_len), dummy_req=self.runtime._dummy_req,
+                             dummy_slot=int(state.num_pages) * page, dummy_page=int(state.num_pages), device=state.device)
+        pool = state.ctx.kv_cache
+
+        def fmha(layer, mb, q, metadata, out):
+            trtllm_decode_into(backends[mb], layer, q, metadata, out)
+
+        self._cad_subs: list = []
+        tasks = CadAttnTasks(win=win, ops=cad_hop, dims=dims, kv=lambda layer: (pool.k_cache(layer), pool.v_cache(layer)),
+                             meta=meta, fmha=fmha, model_peer=ranks.peers[0], j=int(ranks.peer_j),
+                             subs_of=lambda _cmd: self._cad_subs)
+        runtime = CadNodeRuntime(tasks, program("attn", L, m), win, ops=cad_hop,
+                                 backend=TorchCadBackend(device=state.device),
+                                 log=lambda s: log_line(self.log_path, s, flush=True), label=f"cad-attn{ranks.rank}")
+        log_line(self.log_path, f"{tag} warm (paired eager + capture over the CAD world)", flush=True)
+        with torch.cuda.stream(state.stream):
+            captured = runtime.warm(sorted(int(b) for b in cmd.buckets), graphs=bool(cmd.use_graph))
+        self._cad = {"cfg": cfg, "ranks": ranks, "window": win, "tasks": tasks, "runtime": runtime}
+        log_line(self.log_path, f"[cad-attn{ranks.rank}] ready: layout {lay.describe()}, graphs {captured}", flush=True)
+        self._send_reply(AfdCadReadyReply(worker_rank=int(self.worker_rank), captured=tuple(captured)))
+
+    def _run_cad_step(self, cmd) -> None:
+        """AfdRunCadStepCmd: this rank's plan materialized as an AFD AG decode step's KV side (kv_only: page grants,
+        positions, K / V slots, per-mb FMHA metadata), then the CAD step (synchronous; the reply carries the abort word)."""
+        from minisgl.cad.runtime import CadStepAborted
+
+        from .afd_protocol import AfdCadStepReply
+
+        st = getattr(self, "_cad", None)
+        if st is None:
+            raise RuntimeError("AfdRunCadStepCmd before AfdCadInitCmd")
+        if len(cmd.plans) != 1:
+            raise RuntimeError(f"CAD attention step {cmd.step_id}: {len(cmd.plans)} plans, an attention rank takes its own")
+        plan = cmd.plans[0]
+        if str(plan.phase) != "decode" or getattr(plan, "spec_verify", False):
+            raise RuntimeError(f"CAD attention step {cmd.step_id}: phase {plan.phase} (CAD steps are plain decode)")
+        try:
+            batch = self.runtime.materialize_ag_plan(plan, kv_only=True)
+        except Exception:
+            log_line(self.log_path, f"[cad-attn] materialize:error step_id={int(cmd.step_id)} tables="
+                                    f"{tuple(int(x) for x in plan.table_indices)[:8]}", flush=True)
+            raise
+        self._cad_subs = list(batch.afd_mb_subbatches or [batch])
+        self._wait_for_ag_materialization()
+        with torch.cuda.stream(self.runtime_state.stream):
+            _done, finish = st["runtime"].run_step(cmd)
+        err = 0
+        try:
+            finish()
+        except CadStepAborted as exc:
+            err = int(st["window"].err.item()) or 1
+            log_line(self.log_path, f"[cad-attn] step {int(cmd.step_id)} aborted: {exc}", flush=True)
+        self._cad_subs = []
+        self._send_reply(AfdCadStepReply(worker_rank=int(self.worker_rank), step_id=int(cmd.step_id), tokens={}, err=err,
+                                         sent_ns=int(getattr(cmd, "sent_ns", 0))))
 
     def _run_ag_forward_eager(self, batch, plan: AfdAGStepPlan, model, adapters, ctx):
         """Eager AG fallback used for prefill, graph-off debug, or bucket miss.
@@ -923,6 +1178,15 @@ class AfdAttentionWorker(BaseAfdWorker):
         dispatch/combine through the AG pipeline.
         """
         state = self._build_ag_mb_state(batch, plan, model, adapters, ctx)
+        spec = getattr(self, "_afd_spec", None)
+        if spec is not None and str(plan.phase) == "prefill":
+            tok_offs = plan.microbatch_token_offsets
+            features = spec.new_feature_buffer(int(tok_offs[-1]), state.hidden[0].dtype)
+            batch.afd_spec_features = features
+            state.capture_cols = spec.capture_cols
+            state.features = [
+                features[int(tok_offs[mb]) : int(tok_offs[mb + 1])] for mb in range(state.num_mb)
+            ]
         with nvtx_range("AFD_AG_PipelineMB"):
             _run_ag_pipeline_body(
                 state=state,
@@ -931,7 +1195,9 @@ class AfdAttentionWorker(BaseAfdWorker):
                 adapters=adapters,
                 ctx=ctx,
                 engine_stream=self.runtime_state.stream,
-                phase=str(plan.phase),
+                # The pipeline's phase only picks the dispatch mode; verify tokens
+                # dispatch as decode tokens, matching the EG's decode step.
+                phase="decode" if getattr(plan, "spec_verify", False) else str(plan.phase),
                 retain_graph_objects=False,
                 retire_async_objects=True,
             )
@@ -1022,11 +1288,13 @@ class AfdAttentionWorker(BaseAfdWorker):
     def _ag_graph_replay_info(self, batch, plan: AfdAGStepPlan) -> tuple[bool, int]:
         graph_bs = len(batch.padded_reqs)
         ag_graph = self._afd_ag_graph
+        spec_verify = bool(getattr(plan, "spec_verify", False))
+        is_verify_runner = getattr(self, "_afd_spec", None) is not None
         use_graph = (
             self.enable_decode_graph
             and plan.use_decode_graph
             and ag_graph is not None
-            and plan.phase == "decode"
+            and (plan.phase == "decode" and not is_verify_runner or spec_verify and is_verify_runner)
             and ag_graph.has_bucket(graph_bs)
         )
         return bool(use_graph), int(graph_bs)
@@ -1038,7 +1306,8 @@ class AfdAttentionWorker(BaseAfdWorker):
             log_line(
                 self.log_path,
                 f"[{self.role} rank={self.tp_rank}] afd_ag_decode_graph:replay "
-                f"step_id={int(plan.step_id)} bs={int(graph_bs)} num_mb={int(plan.num_mb)}",
+                f"step_id={int(plan.step_id)} real={int(plan.real_size)} "
+                f"bs={int(graph_bs)} num_mb={int(plan.num_mb)}",
                 flush=True,
             )
             return self._afd_ag_graph.replay(batch, graph_bs)
@@ -1057,6 +1326,15 @@ class AfdAttentionWorker(BaseAfdWorker):
         runtime_state = self.runtime_state
         num_sampling = int(batch.afd_num_sampling)
         if num_sampling <= 0:
+            # Nothing to write back, but the runtime stream must still wait for this
+            # step's forward, as the sampling path's wait below makes it do. The step's
+            # input tensors (positions, KV slots, block tables, seq lens) were allocated
+            # on the runtime stream by materialize_ag_plan and are released when the step
+            # returns; the caching allocator then hands their blocks to the next plan's
+            # materialize on that same stream. Unordered, an empty (real=0) lane lets
+            # those writes land before a lagging compute stream has read this step's
+            # inputs, and the forward indexes with another step's values.
+            sched.stream.wait_stream(runtime_state.stream)
             return torch.empty((0,), dtype=torch.int32, device=runtime_state.device)
 
         total_start_ns = time.perf_counter_ns()
@@ -1081,6 +1359,7 @@ class AfdAttentionWorker(BaseAfdWorker):
 
         # Writeback runs on the runtime stream but reads next_tokens produced on
         # the compute stream; order it so the next step's embed never sees stale ids.
+        # The same wait orders the reuse of this step's materialized inputs (above).
         wait_start_ns = sample_done_ns
         sched.stream.wait_stream(runtime_state.stream)
         wait_done_ns = time.perf_counter_ns()
@@ -1103,16 +1382,88 @@ class AfdAttentionWorker(BaseAfdWorker):
             )
         return next_tokens
 
+    def _spec_step_runs_ahead(self, plan) -> bool:
+        """Device-input mode: may this step be launched before the previous verify reply is applied?
+
+        Verify steps that replay a captured graph gather their length-dependent inputs on the
+        device; prefill steps do not depend on verify replies. An eager verify step (no graph
+        bucket) still needs the host's exact lengths.
+        """
+        spec = self._afd_spec
+        if spec is None or not getattr(spec, "device_inputs", False):
+            return False
+        if not getattr(plan, "spec_verify", False):
+            return str(plan.phase) == "prefill"
+        graph = getattr(self, "_afd_ag_graph", None)
+        padded = int(plan.microbatch_offsets[-1]) if plan.microbatch_offsets else 0
+        return (
+            graph is not None and self.enable_decode_graph and plan.use_decode_graph
+            and getattr(graph, "device_inputs", False) and graph.has_bucket(padded)
+        )
+
+    def _finish_spec_verify(self, batch, final: torch.Tensor) -> torch.Tensor:
+        spec = self._afd_spec
+        if spec is None:
+            raise RuntimeError("AG received a speculative verify step without MINISGL_AFD_SPEC")
+        with nvtx_range("AFD_AG_SpecVerify"):
+            total = getattr(batch, "afd_spec_graph_total", None)
+            if total is not None:
+                spec.mark("forward")
+                batch.afd_spec_cached = [(int(r.table_idx), int(r.cached_len)) for r in batch.reqs]
+                batch.afd_spec_gens = [getattr(r, "afd_spec_gen", None) or 0 for r in batch.reqs]
+                if getattr(self._afd_ag_graph, "device_inputs", False):
+                    batch.afd_spec_tail_slots = int(total)
+                reply = self._afd_ag_graph.replay_finish(total)
+                # The reply is final before the draft runs: copy it out from there.
+                batch.afd_spec_reply_ready = self._afd_ag_graph.reply_ready
+                spec.mark("finish")
+            else:
+                reply = spec.finish_verify(batch, final, batch.afd_spec_features)
+        # The next plan's materialize (sched.stream) reads the token_pool and GDN
+        # state written here, and reuses this step's input buffers.
+        self.runtime.stream.wait_stream(self.runtime_state.stream)
+        return reply
+
+    def _finish_spec_prefill(self, batch, next_tokens: torch.Tensor) -> None:
+        with nvtx_range("AFD_AG_SpecPrefillDraft"):
+            self._afd_spec.finish_prefill(batch, batch.afd_spec_features, next_tokens)
+        self.runtime.stream.wait_stream(self.runtime_state.stream)
+
+    def _log_spec_stats(self) -> None:
+        spec = self._afd_spec
+        spec.collect_timing()
+        if spec.stats_steps % 20 != 0:
+            return
+        timing = ""
+        if spec.timing_steps:
+            timing = " " + " ".join(
+                f"{name}_ms={total / spec.timing_steps:.3f}" for name, total in spec.timing_sums.items()
+            )
+            spec.timing_sums.clear()
+            spec.timing_steps = 0
+        log_line(
+            self.log_path,
+            f"[{self.role} rank={self.tp_rank}] afd_spec_stats steps={spec.stats_steps} "
+            f"reqs={spec.stats_reqs} tokens={spec.stats_tokens} "
+            f"accept_len={spec.stats_tokens / max(1, spec.stats_reqs):.3f}" + timing,
+            flush=True,
+        )
+
     def _copy_next_tokens_to_host(
         self,
         step_id: int,
         sent_ns: int,
         next_tokens: torch.Tensor,
+        ready: torch.cuda.Event | None = None,
     ) -> _AfdAgInFlight:
         sched = self.runtime
         runtime_state = self.runtime_state
         d2h = self._d2h_stream
-        d2h.wait_stream(runtime_state.stream)
+        # ``ready``: next_tokens is final at this event, before the rest of the step.
+        if ready is not None:
+            d2h.wait_event(ready)
+        else:
+            d2h.wait_stream(runtime_state.stream)
         next_tokens.record_stream(sched.stream)
         next_tokens.record_stream(d2h)
         with torch.cuda.stream(d2h):
@@ -1147,6 +1498,7 @@ class AfdAttentionWorker(BaseAfdWorker):
         """Run one AG step and return the delayed D2H token-copy handle."""
         runtime_state = self.runtime_state
         profile = self._control_profile_enabled(int(plan.step_id))
+        self.log_m2n_barrier_head(step_id=plan.step_id, phase=plan.phase, when="before")
         total_start_ns = time.perf_counter_ns()
         materialize_start_ns = total_start_ns
         batch = self._materialize_ag_batch(plan)
@@ -1158,17 +1510,26 @@ class AfdAttentionWorker(BaseAfdWorker):
         wait_start_ns = materialize_done_ns
         self._wait_for_ag_materialization()
         wait_done_ns = time.perf_counter_ns()
+        spec = getattr(self, "_afd_spec", None)
+        if spec is not None and getattr(plan, "spec_verify", False):
+            with torch.cuda.stream(runtime_state.stream):
+                spec.mark("start")
         with torch.cuda.stream(runtime_state.stream):
             forward_start_ns = time.perf_counter_ns()
             final = self._run_ag_forward(batch, plan, ctx)
             forward_done_ns = time.perf_counter_ns()
-            next_tokens = self._sample_and_writeback_ag(
-                batch,
-                final,
-                ctx,
-                step_id=int(plan.step_id),
-                profile=profile,
-            )
+            if getattr(plan, "spec_verify", False):
+                next_tokens = self._finish_spec_verify(batch, final)
+            else:
+                next_tokens = self._sample_and_writeback_ag(
+                    batch,
+                    final,
+                    ctx,
+                    step_id=int(plan.step_id),
+                    profile=profile,
+                )
+                if getattr(self, "_afd_spec", None) is not None and str(plan.phase) == "prefill":
+                    self._finish_spec_prefill(batch, next_tokens)
             sample_done_ns = time.perf_counter_ns()
         # ONE-STEP-AHEAD: instead of synchronizing the compute/runtime streams and
         # blocking on a gpu->cpu copy EVERY step (the big AG/EG replay gap), queue an
@@ -1181,7 +1542,13 @@ class AfdAttentionWorker(BaseAfdWorker):
             int(plan.step_id),
             int(sent_ns),
             next_tokens,
+            ready=getattr(batch, "afd_spec_reply_ready", None),
         )
+        if getattr(plan, "spec_verify", False):
+            handle.spec_cached = getattr(batch, "afd_spec_cached", [])
+            handle.spec_real_slots = getattr(batch, "afd_spec_real_slots", [])
+            handle.spec_gens = getattr(batch, "afd_spec_gens", None)
+            handle.spec_tail_slots = int(getattr(batch, "afd_spec_tail_slots", 0) or 0)
         copy_done_ns = time.perf_counter_ns()
         if profile:
             log_line(
@@ -1198,6 +1565,7 @@ class AfdAttentionWorker(BaseAfdWorker):
                 f"d2h_enqueue_ms={(copy_done_ns - copy_start_ns) / 1_000_000.0:.3f} "
                 f"total_enqueue_ms={(copy_done_ns - total_start_ns) / 1_000_000.0:.3f}",
             )
+        self.log_m2n_barrier_head(step_id=plan.step_id, phase=plan.phase, when="after")
         return handle
 
     def _process_last_afd_ag(self, last: "_AfdAgInFlight | None") -> None:
@@ -1212,6 +1580,19 @@ class AfdAttentionWorker(BaseAfdWorker):
             last.copy_done.synchronize()
             sync_done_ns = time.perf_counter_ns()
             next_tokens_cpu = [int(t) for t in last.next_tokens_cpu.tolist()]
+            if last.spec_cached is not None:
+                committed = None
+                if last.spec_tail_slots:
+                    # [packed rows of every slot][committed length of every slot]
+                    width = self._afd_spec.spec.block + 1
+                    head = last.spec_tail_slots * width
+                    tail = next_tokens_cpu[head:]
+                    next_tokens_cpu = next_tokens_cpu[:head]
+                    committed = [tail[slot] for slot in last.spec_real_slots]
+                next_tokens_cpu = self._afd_spec.real_reply(next_tokens_cpu, last.spec_real_slots)
+                self._afd_spec.apply_reply(last.spec_cached, next_tokens_cpu, committed, last.spec_gens)
+                if last.spec_cached:
+                    self._log_spec_stats()
             list_done_ns = time.perf_counter_ns()
             self._send_reply(
                 AfdAGStepReply(

@@ -15,13 +15,18 @@ This runs a sequential online AFD-vs-vLLM alignment pipeline:
 
 Options:
   --env NAME                  Expected active conda env. Default: minisgl-cuda130
+  --vllm-env NAME|PATH        Env used only for vLLM: a conda env name, or the path
+                              of a Python env (contains '/'; e.g. a venv), whose
+                              bin/vllm then runs without conda run. Defaults to --env.
   --model PATH                Model path or HF repo. Required.
+  --vllm-model PATH           Optional vLLM-only model path. Defaults to --model.
   --prompt-file FILE          UTF-8 prompt file. Required.
   --prompt-repeat N           Repeat prompt set in memory. Default: 1
   --batch-size N              AFD online batch size. Default: 8
   --max-new-tokens N          Sampling max new tokens. Default: 1
   --cuda-graph-max-bs N       AFD decode graph cap. Default: batch size
   --decode-graph-bs CSV       Optional static AFD decode graph buckets
+  --afd-num-mb N              AFD microbatches per step. Default: 1
   --max-batched-tokens N      Static eager prefill token budget / comm buffer sizing. Default: 8192
   --cache-type NAME           KV cache manager strategy for AFD. Default: naive
   --gpus CSV                  CUDA_VISIBLE_DEVICES for vLLM. Default: 0,1,2,3
@@ -51,6 +56,21 @@ Options:
   --vllm-max-model-len N      Optional
   --output-json FILE          Optional final report JSON path
   --keep-artifacts            Keep temp artifacts and print paths
+
+Environment:
+  VLLM_ENV_SETUP              With a path-type --vllm-env only: a bash file sourced
+                              for the vLLM process alone (the venv counterpart of a
+                              conda env's etc/conda/activate.d), e.g. to name the CUDA
+                              toolkit a venv lacks.
+  VLLM_ENGINE_READY_TIMEOUT_S Seconds vLLM waits for its engine cores to start.
+                              Default: 3600; vLLM's own 600 is shorter than a cold
+                              FlashInfer JIT start. Unless already exported, it is
+                              set for the vLLM process alone; a VLLM_ENV_SETUP file
+                              that sets it wins.
+  ALIGN_MIN_TOP10_RATE, ALIGN_MIN_TOP1_RATE, ALIGN_MIN_TOP100_RATE
+                              Thresholds passed to check_alignment_report.py.
+                              Defaults: top-10 1.0, top-1 not checked, and top-100
+                              the checker's default of 1.0.
 EOF
 }
 
@@ -217,13 +237,16 @@ log_step() {
 }
 
 ENV_NAME="minisgl-cuda130"
+VLLM_ENV_NAME=""
 MODEL=""
+VLLM_MODEL=""
 PROMPT_FILE=""
 PROMPT_REPEAT="1"
 AFD_BATCH_SIZE="8"
 MAX_NEW_TOKENS="1"
 AFD_CUDA_GRAPH_MAX_BS=""
 AFD_DECODE_GRAPH_BS=""
+AFD_NUM_MB="1"
 AFD_MAX_BATCHED_TOKENS="8192"
 AFD_MAX_RUNNING_REQUESTS="0"
 CACHE_TYPE="naive"
@@ -264,13 +287,16 @@ VLLM_PID=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --env) ENV_NAME="$2"; shift 2 ;;
+    --vllm-env) VLLM_ENV_NAME="$2"; shift 2 ;;
     --model) MODEL="$2"; shift 2 ;;
+    --vllm-model) VLLM_MODEL="$2"; shift 2 ;;
     --prompt-file) PROMPT_FILE="$2"; shift 2 ;;
     --prompt-repeat) PROMPT_REPEAT="$2"; shift 2 ;;
     --batch-size) AFD_BATCH_SIZE="$2"; shift 2 ;;
     --max-new-tokens) MAX_NEW_TOKENS="$2"; shift 2 ;;
     --cuda-graph-max-bs) AFD_CUDA_GRAPH_MAX_BS="$2"; shift 2 ;;
     --decode-graph-bs) AFD_DECODE_GRAPH_BS="$2"; shift 2 ;;
+    --afd-num-mb) AFD_NUM_MB="$2"; shift 2 ;;
     --max-batched-tokens) AFD_MAX_BATCHED_TOKENS="$2"; shift 2 ;;
     --afd-max-running-requests) AFD_MAX_RUNNING_REQUESTS="$2"; shift 2 ;;
     --cache-type) CACHE_TYPE="$2"; shift 2 ;;
@@ -308,11 +334,29 @@ done
 if [[ -z "$AFD_CUDA_GRAPH_MAX_BS" ]]; then
   AFD_CUDA_GRAPH_MAX_BS="$AFD_BATCH_SIZE"
 fi
+if (( AFD_NUM_MB < 1 )); then
+  echo "--afd-num-mb must be >= 1, got: $AFD_NUM_MB" >&2
+  exit 1
+fi
+# A cold reference start compiles FlashInfer kernels before its engine cores
+# report ready: 920 s on the Qwen3.5-397B reference, past vLLM's 600 s default.
+# Checked here so a bad value fails before the AFD phase, not an hour into it.
+VLLM_ENGINE_READY_TIMEOUT_S="${VLLM_ENGINE_READY_TIMEOUT_S:-3600}"
+if [[ ! "$VLLM_ENGINE_READY_TIMEOUT_S" =~ ^[1-9][0-9]*$ ]]; then
+  echo "VLLM_ENGINE_READY_TIMEOUT_S must be a positive whole number of seconds, got: '$VLLM_ENGINE_READY_TIMEOUT_S'" >&2
+  exit 1
+fi
 
 if [[ -z "$MODEL" || -z "$PROMPT_FILE" ]]; then
   echo "--model and --prompt-file are required" >&2
   usage >&2
   exit 1
+fi
+if [[ -z "$VLLM_MODEL" ]]; then
+  VLLM_MODEL="$MODEL"
+fi
+if [[ -z "$VLLM_ENV_NAME" ]]; then
+  VLLM_ENV_NAME="$ENV_NAME"
 fi
 
 if [[ ! -f "$PROMPT_FILE" ]]; then
@@ -367,6 +411,9 @@ done
 # shellcheck source=/dev/null
 source "$_common_dir/scripts/lib/common.sh"
 fastafd_init_paths "$SCRIPT_DIR"
+# Make a path-type vLLM env absolute before this script changes directory.
+VLLM_ENV_PREFIX="$(fastafd_python_env_prefix "$VLLM_ENV_NAME")" || exit 1
+VLLM_ENV_NAME="${VLLM_ENV_PREFIX:-$VLLM_ENV_NAME}"
 REPORT_DIR="$CALIB_DIR/reports"
 mkdir -p "$REPORT_DIR"
 export MINISGL_LOCAL_CACHE_BASE="${MINISGL_LOCAL_CACHE_BASE:-$CALIB_DIR/cache}"
@@ -377,13 +424,20 @@ export N2M_M2N_GIN_BUILD_DIR="${N2M_M2N_GIN_BUILD_DIR:-$MINISGL_LOCAL_CACHE_BASE
 export MINISGL_DEEPEP_BUILD_DIR="${MINISGL_DEEPEP_BUILD_DIR:-$MINISGL_LOCAL_CACHE_BASE/deepep_moe}"
 export MINISGL_DEEPGEMM_BUILD_DIR="${MINISGL_DEEPGEMM_BUILD_DIR:-$MINISGL_LOCAL_CACHE_BASE/deepgemm}"
 TIMESTAMP="$(date -u +%Y%m%d_%H%M%S)"
-TMP_DIR="${TMP_DIR:-$REPORT_DIR/afd_online_alignment_run_${TIMESTAMP}}"
+TMP_DIR="${TMP_DIR:-$(mktemp -d "$REPORT_DIR/afd_online_alignment_${TIMESTAMP}_XXXXXX")}"
 mkdir -p "$TMP_DIR"
 SAMPLE_JSON="$TMP_DIR/sample.json"
 SAMPLE_LOG="$TMP_DIR/sample.log"
 AFD_LOG="$TMP_DIR/afd.log"
 VLLM_LOG="$TMP_DIR/vllm.log"
+REFERENCE_IDENTITY_JSON="$TMP_DIR/reference_identity.json"
 REPORT_JSON="${OUTPUT_JSON:-$TMP_DIR/alignment.json}"
+for artifact in "$SAMPLE_JSON" "$REPORT_JSON" "$AFD_LOG" "$VLLM_LOG" "$REFERENCE_IDENTITY_JSON"; do
+  if [[ -e "$artifact" || -L "$artifact" ]]; then
+    echo "Refusing to reuse alignment artifacts: $artifact; choose a fresh output path." >&2
+    exit 2
+  fi
+done
 AFD_RAY_LOG_DIR="$TMP_DIR/ray_logs"
 mkdir -p "$AFD_RAY_LOG_DIR"
 if [[ "$RAY_NSYS" -eq 1 && -z "$RAY_NSYS_OUTPUT_PREFIX" ]]; then
@@ -411,18 +465,22 @@ cd "$CALIB_DIR"
 
 log_step "Starting online AFD server"
 echo "  model: $MODEL"
+echo "  vllm_model: $VLLM_MODEL"
+echo "  vllm_env: $VLLM_ENV_NAME"
 echo "  prompt_file: $PROMPT_FILE"
 echo "  prompt_repeat: $PROMPT_REPEAT"
 echo "  afd_batch_size: $AFD_BATCH_SIZE"
 echo "  max_new_tokens: $MAX_NEW_TOKENS"
 echo "  afd_cuda_graph_max_bs: $AFD_CUDA_GRAPH_MAX_BS"
 echo "  afd_decode_graph_bs: ${AFD_DECODE_GRAPH_BS:-<auto>}"
+echo "  afd_num_mb: $AFD_NUM_MB"
 echo "  afd_max_batched_tokens: $AFD_MAX_BATCHED_TOKENS"
 echo "  afd_max_running_requests: ${AFD_MAX_RUNNING_REQUESTS:-0}"
 echo "  afd_mlp_ep_size: $AFD_MLP_EP_SIZE"
 echo "  afd_moe_a2a_backend: $AFD_MOE_A2A_BACKEND"
 echo "  afd_moe_runner_backend: $AFD_MOE_RUNNER_BACKEND"
 echo "  vllm_extra_args: ${VLLM_EXTRA_ARGS:-<none>}"
+echo "  vllm_engine_ready_timeout_s: $VLLM_ENGINE_READY_TIMEOUT_S"
 echo "  vllm_use_flashinfer_moe_fp8: ${VLLM_USE_FLASHINFER_MOE_FP8:-<unset>}"
 echo "  vllm_use_deep_gemm: ${VLLM_USE_DEEP_GEMM:-<unset>}"
 echo "  vllm_moe_use_deep_gemm: ${VLLM_MOE_USE_DEEP_GEMM:-<unset>}"
@@ -480,6 +538,7 @@ afd_start_cmd+=(
   --cache-type "$CACHE_TYPE"
   --page-size "$PAGE_SIZE"
   --cuda-graph-max-bs "$AFD_CUDA_GRAPH_MAX_BS"
+  --afd-num-mb "$AFD_NUM_MB"
   --afd-device-comm-num-sms "$AFD_DEVICE_COMM_NUM_SMS"
 )
 if [[ -n "$AFD_DECODE_GRAPH_BS" ]]; then
@@ -495,7 +554,12 @@ fi
 "${afd_start_cmd[@]}" >"$AFD_LOG" 2>&1 &
 AFD_PID=$!
 
-if ! wait_for_ready "http://${SERVER_HOST}:${AFD_PORT}/v1/models" "AFD" "$AFD_LOG" "$AFD_PID"; then
+if ! wait_for_ready \
+  "http://${SERVER_HOST}:${AFD_PORT}/v1/models" \
+  "AFD" \
+  "$AFD_LOG" \
+  "$AFD_PID" \
+  "${AFD_READY_TIMEOUT:-900}"; then
   status="$?"
   if [[ "$status" == "2" ]]; then
     fail_with_logs "AFD exited before becoming ready" 1 "$AFD_LOG"
@@ -515,7 +579,7 @@ sample_cmd=(
   --top-p 1
   --top-k 1
   --sample-concurrency "$SAMPLE_CONCURRENCY"
-  --timeout 600
+  --timeout "${AFD_SAMPLE_TIMEOUT:-600}"
   --sample-json "$SAMPLE_JSON"
 )
 if [[ "$BATCH_SUBMIT" -eq 1 ]]; then
@@ -537,19 +601,30 @@ wait "$AFD_PID" >/dev/null 2>&1 || true
 AFD_PID=""
 
 log_step "Starting vLLM"
-"$SCRIPT_ROOT/serve/vllm_server.sh" \
-  --env "$ENV_NAME" \
-  --model "$MODEL" \
-  --gpus "$GPUS" \
-  --port "$VLLM_PORT" \
-  --host "$SERVER_HOST" \
-  --tp-size "$VLLM_TP_SIZE" \
-  --max-model-len "$VLLM_MAX_MODEL_LEN" \
-  --extra-args "$VLLM_EXTRA_ARGS" \
-  >"$VLLM_LOG" 2>&1 &
+vllm_start_cmd=(
+  "$SCRIPT_ROOT/serve/vllm_server.sh"
+  --env "$VLLM_ENV_NAME"
+  --model "$VLLM_MODEL"
+  --gpus "$GPUS"
+  --port "$VLLM_PORT"
+  --host "$SERVER_HOST"
+  --tp-size "$VLLM_TP_SIZE"
+  --max-model-len "$VLLM_MAX_MODEL_LEN"
+  --extra-args "$VLLM_EXTRA_ARGS"
+  --identity-json "$REFERENCE_IDENTITY_JSON"
+)
+mapfile -t vllm_env_launcher < <(fastafd_vllm_env_launcher "$ENV_NAME" "$VLLM_ENV_NAME")
+vllm_start_cmd=(env "VLLM_ENGINE_READY_TIMEOUT_S=$VLLM_ENGINE_READY_TIMEOUT_S"
+  "${vllm_env_launcher[@]}" "${vllm_start_cmd[@]}")
+"${vllm_start_cmd[@]}" >"$VLLM_LOG" 2>&1 &
 VLLM_PID=$!
 
-if ! wait_for_ready "http://${SERVER_HOST}:${VLLM_PORT}/v1/models" "vLLM" "$VLLM_LOG" "$VLLM_PID"; then
+if ! wait_for_ready \
+  "http://${SERVER_HOST}:${VLLM_PORT}/v1/models" \
+  "vLLM" \
+  "$VLLM_LOG" \
+  "$VLLM_PID" \
+  "${VLLM_READY_TIMEOUT:-900}"; then
   status="$?"
   if [[ "$status" == "2" ]]; then
     fail_with_logs "vLLM exited before becoming ready" 1 "$VLLM_LOG"
@@ -562,43 +637,22 @@ if ! python "$SCRIPT_ROOT/validate/compare_minisgl_vllm.py" score \
   --sample-json "$SAMPLE_JSON" \
   --vllm-url "http://${SERVER_HOST}:${VLLM_PORT}" \
   --prompt-logprobs "$PROMPT_LOGPROBS" \
-  --timeout 600 \
+  --timeout "${VLLM_SCORE_TIMEOUT:-600}" \
   --output-json "$REPORT_JSON" \
+  --reference-identity-json "$REFERENCE_IDENTITY_JSON" \
   >"$TMP_DIR/score.log" 2>&1; then
   fail_with_logs "vLLM scoring failed" 1 "$TMP_DIR/score.log" "$VLLM_LOG"
 fi
 
-python - <<'PY' "$REPORT_JSON" "${ALIGN_MIN_TOP1_RATE:-}" "${ALIGN_MIN_TOP10_RATE:-1.0}"
-import json
-import sys
-
-path, min_top1_raw, min_top10_raw = sys.argv[1:4]
-with open(path, "r", encoding="utf-8") as f:
-    report = json.load(f)
-summary_payload = report.get("summary", {})
-
-summary = {
-    "overall_top1_agreement_rate": summary_payload.get("overall_top1_agreement_rate"),
-    "overall_top10_hit_rate": summary_payload.get("overall_top10_hit_rate"),
-    "overall_top100_hit_rate": summary_payload.get("overall_top100_hit_rate"),
-    "overall_avg_rank_in_vllm": summary_payload.get("overall_avg_rank_in_vllm"),
-    "overall_max_rank_in_vllm": summary_payload.get("overall_max_rank_in_vllm"),
-}
-print(json.dumps(summary, ensure_ascii=False, indent=2))
-
-if min_top1_raw:
-    min_top1 = float(min_top1_raw)
-    if (summary_payload.get("overall_top1_agreement_rate") or 0.0) < min_top1:
-        raise SystemExit(
-            f"overall_top1_agreement_rate={summary_payload.get('overall_top1_agreement_rate')} < {min_top1}"
-        )
-
-min_top10 = float(min_top10_raw)
-if (summary_payload.get("overall_top10_hit_rate") or 0.0) < min_top10:
-    raise SystemExit(
-        f"overall_top10_hit_rate={summary_payload.get('overall_top10_hit_rate')} < {min_top10}"
-    )
-PY
+gate_args=(--report "$REPORT_JSON" --sample-json "$SAMPLE_JSON"
+  --min-top10 "${ALIGN_MIN_TOP10_RATE:-1.0}")
+if [[ -n "${ALIGN_MIN_TOP1_RATE:-}" ]]; then
+  gate_args+=(--min-top1 "$ALIGN_MIN_TOP1_RATE")
+fi
+if [[ -n "${ALIGN_MIN_TOP100_RATE:-}" ]]; then
+  gate_args+=(--min-top100 "$ALIGN_MIN_TOP100_RATE")
+fi
+python "$SCRIPT_ROOT/validate/check_alignment_report.py" "${gate_args[@]}"
 
 log_step "Completed"
 echo "sample_json: $SAMPLE_JSON"
@@ -606,3 +660,4 @@ echo "report_json: $REPORT_JSON"
 echo "afd_log: $AFD_LOG"
 echo "ray_log_dir: $AFD_RAY_LOG_DIR"
 echo "vllm_log: $VLLM_LOG"
+echo "reference_identity_json: $REFERENCE_IDENTITY_JSON"

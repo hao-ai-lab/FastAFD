@@ -15,6 +15,9 @@ class TokenizeManager:
         results: List[torch.Tensor] = []
         # TODO: batch tokenization
         for msg in msgs:
+            if msg.input_ids is not None:  # the API took token ids: nothing to encode
+                results.append(msg.input_ids.view(-1).to(torch.int32))
+                continue
             if isinstance(msg.text, list):
                 prompt = self.tokenizer.apply_chat_template(
                     msg.text,

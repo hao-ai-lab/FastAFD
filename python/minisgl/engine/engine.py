@@ -9,9 +9,10 @@ import torch
 from minisgl.attention import create_attention_backend
 from minisgl.core import Batch, Context, Req, set_global_ctx
 from minisgl.distributed import destroy_distributed, enable_pynccl_distributed, set_tp_info
-from minisgl.kvcache import create_kvcache_pool
+from minisgl.kvcache import create_hybrid_gdn_state_pool, create_kvcache_pool
 from minisgl.layers import set_rope_device
 from minisgl.models import create_model, load_weight
+from minisgl.models.weight import cast_checkpoint_tensor
 from minisgl.moe import create_moe_backend
 from minisgl.utils import div_even, init_logger, is_sm90_supported, is_sm100_supported, torch_dtype
 
@@ -188,6 +189,20 @@ def _install_flashinfer_ninja_env_sanitizer() -> None:
     logger.info("Installed FlashInfer ninja env sanitizer for Nsight profiling")
 
 
+def _checkpoint_float32_key(model_config, key: str) -> bool:
+    """Whether the colocated engine keeps checkpoint tensor `key` (a loaded, runtime
+    name) in float32 beyond cast_checkpoint_tensor's own rule (packed tensors as stored,
+    `*_scale` float32): the router weights and biases a model computes in float32."""
+    arch = (getattr(model_config, "architectures", None) or [""])[0]
+    if arch == "MiniMaxM2ForCausalLM":
+        return key.endswith((".mlp.gate.weight", ".mlp.e_score_correction_bias"))
+    if arch == "Glm4MoeForCausalLM":
+        return key.endswith((".mlp.gate.weight", ".mlp.gate.e_score_correction_bias"))
+    if arch == "Qwen3_5MoeForConditionalGeneration":
+        return key.endswith(".linear_attn.A_log")
+    return False
+
+
 class ForwardOutput(NamedTuple):
     next_tokens_gpu: torch.Tensor
     next_tokens_cpu: torch.Tensor
@@ -238,6 +253,19 @@ class Engine:
             self.model.load_state_dict(self._load_weight_state_dict(config))
 
             # ======================= KV cache initialization ========================
+            self.ctx.gdn_state_pool = create_hybrid_gdn_state_pool(
+                config.model_config,
+                max_slots=config.max_running_req + 1,
+                dtype=self.dtype,
+                device=self.device,
+            )
+            if self.ctx.gdn_state_pool is not None:
+                logger.info_rank0(
+                    "Allocated hybrid GDN state: layers=%d slots=%d bytes_per_slot=%d",
+                    len(self.ctx.gdn_state_pool.layer_ids),
+                    self.ctx.gdn_state_pool.max_slots,
+                    self.ctx.gdn_state_pool.bytes_per_slot,
+                )
             self.num_pages = self._determine_num_pages(init_free_memory, config)
             num_tokens = self.num_pages * config.page_size
             self.ctx.kv_cache = self.kv_cache = create_kvcache_pool(
@@ -305,35 +333,13 @@ class Engine:
                 for k, v in self.model.state_dict().items()
             }
         else:
-            is_minimax_m2 = (
-                getattr(config.model_config, "architectures", [""])[0]
-                == "MiniMaxM2ForCausalLM"
-            )
-            is_glm4_moe = (
-                getattr(config.model_config, "architectures", [""])[0]
-                == "Glm4MoeForCausalLM"
-            )
-
-            def _minimax_fp32_key(key: str) -> bool:
-                return is_minimax_m2 and (
-                    key.endswith(".mlp.gate.weight")
-                    or key.endswith(".mlp.e_score_correction_bias")
-                )
-
-            def _glm4_fp32_key(key: str) -> bool:
-                return is_glm4_moe and (
-                    key.endswith(".mlp.gate.weight")
-                    or key.endswith(".mlp.gate.e_score_correction_bias")
-                )
-
+            model_config = config.model_config
             return {
-                k: (
-                    v
-                    if v.dtype == torch.float8_e4m3fn
-                    or (v.dtype == torch.float32 and k.endswith("_scale"))
-                    else v.to(torch.float32)
-                    if _minimax_fp32_key(k) or _glm4_fp32_key(k)
-                    else v.to(self.dtype)
+                k: cast_checkpoint_tensor(
+                    k,
+                    v,
+                    self.dtype,
+                    float32=_checkpoint_float32_key(model_config, k),
                 )
                 for k, v in load_weight(config.model_path, self.device)
             }
@@ -346,7 +352,8 @@ class Engine:
             * div_even(config.model_config.num_kv_heads, config.tp_info.size, allow_replicate=True)
             * config.page_size
             * self.dtype.itemsize
-            * config.model_config.num_layers
+            # what the pool allocates: every layer that keeps KV
+            * len(config.model_config.kv_cache_layer_ids)
         )
         num_pages = config.num_page_override
         if num_pages is None:

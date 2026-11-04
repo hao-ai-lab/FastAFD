@@ -1,4 +1,13 @@
 #!/usr/bin/env bash
+# Kill AFD and vLLM processes by command-line pattern on EVERY live Ray node.
+#
+# One Ray task per alive node in ray.nodes() SIGKILLs each process whose command
+# line contains one of the patterns below (or the patterns given as arguments).
+# It does not check which job, run or user started a process, so on a shared Ray
+# cluster it also kills other people's jobs. Run it only on a Ray cluster you have
+# to yourself. The experiment presets call it only with CLEAN_FIRST=1 or
+# CLEAN_AFTER=1 (both default 0), and before their vLLM stage when
+# RUN_VLLM_ALIGNMENT=1.
 set -eo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

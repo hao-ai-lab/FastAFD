@@ -131,7 +131,6 @@ def _run_eg_deepep_pipeline_body(
         [None for _ in range(num_mb)] for _ in range(num_layers)
     ]
     retired: list[tuple[torch.cuda.Event, Any, Any]] = []
-    graph_live_objects: list[Any] = []
 
     def retire(force: bool = False) -> None:
         if not retired:
@@ -187,8 +186,11 @@ def _run_eg_deepep_pipeline_body(
             retired.append((done, disp, expert_out))
             if len(retired) >= 4:
                 retire(force=True)
-        elif torch.cuda.is_current_stream_capturing():
-            graph_live_objects.extend((disp, expert_out))
+        # During graph capture, release each layer's Python objects as soon as
+        # combine has been enqueued. Dispatch storage is created and retired on
+        # the lane stream; expert_out.record_stream above covers its
+        # engine-to-lane handoff. Retaining every layer until capture ends
+        # prevents the graph-private allocator from reusing those buffers.
         dispatches[layer][mb] = None
         expert_outputs[layer][mb] = None
 
@@ -383,10 +385,13 @@ class AfdEgDecodeGraphRunner:
             fn=_fn,
         )
         self.graphs[total] = graph
+        allocated_gib = torch.cuda.memory_allocated(self.device) / (1024**3)
+        reserved_gib = torch.cuda.memory_reserved(self.device) / (1024**3)
         log_line(
             self.log_path,
             f"[{self.label}] afd_eg_decode_graph warmup:done total={total} "
-            f"mb_bs={mb_bs} schedule=paper_pipeline lanes={len(lane_streams)}",
+            f"mb_bs={mb_bs} schedule=paper_pipeline lanes={len(lane_streams)} "
+            f"allocated_gib={allocated_gib:.2f} reserved_gib={reserved_gib:.2f}",
             flush=True,
         )
 
@@ -423,6 +428,7 @@ class AfdExpertWorker(BaseAfdWorker):
         runtime_state = self.runtime_state
         bucket = int(plan.dispatch_bucket)
         profile = self._control_profile_enabled(int(plan.step_id))
+        self.log_m2n_barrier_head(step_id=plan.step_id, phase=plan.phase, when="before")
         total_start_ns = time.perf_counter_ns()
         mode = "eager"
 
@@ -466,6 +472,7 @@ class AfdExpertWorker(BaseAfdWorker):
                 f"event_record_ms={(event_done_ns - event_start_ns) / 1_000_000.0:.3f} "
                 f"total_enqueue_ms={(event_done_ns - total_start_ns) / 1_000_000.0:.3f}",
             )
+        self.log_m2n_barrier_head(step_id=plan.step_id, phase=plan.phase, when="after")
         return _AfdEgInFlight(
             step_id=int(plan.step_id),
             sent_ns=int(sent_ns),
@@ -483,6 +490,7 @@ class AfdExpertWorker(BaseAfdWorker):
         if not (_eg_uses_megamoe(adapter) and adapter.use_persistent(int(plan.num_mb))):
             return False
         lane_streams = tuple(self._afd_comm_streams) or (self.runtime_state.stream,)
+        self._order_lanes_after_engine(lane_streams)
         with torch.cuda.stream(lane_streams[0]):
             adapter.eg_moe_persistent(
                 int(self.num_layers),
@@ -491,6 +499,37 @@ class AfdExpertWorker(BaseAfdWorker):
             )
         self.runtime_state.stream.wait_stream(lane_streams[0])
         return True
+
+    def _order_lanes_after_engine(self, lane_streams: tuple[torch.cuda.Stream, ...]) -> None:
+        """Make this step's lane streams wait for everything on the engine stream.
+
+        The M2N launches against one symmetric buffer are a STATEFUL CHAIN, not
+        independent kernels: each layer's tag-3 cleanup barrier is split, so the
+        `arrive` at the end of one launch is consumed by the `wait` at the start
+        of the next (`comm/barrier.cuh:83-90`), and that wait "must complete
+        before phase 0 overwrites x/sf/weights that the EG ranks may still be
+        pulling" (`sm100_mega_moe_m2n.cuh:357-368`). Two launches on one buffer
+        must therefore never overlap.
+
+        A graph-replayed decode step runs its whole chain on the ENGINE stream
+        (`AfdEgDecodeGraphRunner.replay`), while every eager step runs its chain
+        on the LANE streams. The closing `runtime_state.stream.wait_stream(lane)`
+        below gives the lane -> engine edge, so eager-then-replay is ordered; the
+        engine -> lane edge did not exist, so replay-then-eager was NOT, and the
+        next step's first `eg_moe` could execute concurrently with the replay it
+        follows. Both still run their full round count, so the barrier counter
+        stays in lockstep and nothing hangs -- the corruption is silent.
+
+        The AG side gets this edge implicitly: its comm stream waits on an event
+        recorded on the engine stream during the same step
+        (`afd_attention_worker.py:847`, `:877`), and an in-order stream makes that
+        cover everything enqueued earlier. The EG side has no such event because
+        it has no per-layer compute on the engine stream to hang one on.
+        """
+        engine = self.runtime_state.stream
+        for stream in lane_streams:
+            if stream is not engine:
+                stream.wait_stream(engine)
 
     def _run_eg_pipeline_eager(self, plan: AfdEGStepPlan, bucket: int) -> None:
         """Eager EG fallback used for prefill, graph-off debug, or bucket miss.
@@ -504,6 +543,7 @@ class AfdExpertWorker(BaseAfdWorker):
         expert_stage = self._afd_eg_model
         is_megamoe_backend = _eg_uses_megamoe(adapter)
         lane_streams = tuple(self._afd_comm_streams) or (self.runtime_state.stream,)
+        self._order_lanes_after_engine(lane_streams)
         if len(adapters) < max(1, int(plan.num_mb)):
             raise RuntimeError(
                 f"EG afd requires >= num_mb adapters, "
@@ -568,6 +608,13 @@ class AfdExpertWorker(BaseAfdWorker):
             )
         )
         send_done_ns = time.perf_counter_ns()
+        # MINISGL_MEGAMOE_EG_TIMING_DUMP=<prefix>: save the raw EG timing buffer at the
+        # steps in MINISGL_MEGAMOE_EG_TIMING_DUMP_STEPS (comma list). Diagnostic only.
+        _prefix = os.environ.get("MINISGL_MEGAMOE_EG_TIMING_DUMP")
+        if _prefix and str(int(last.step_id)) in os.environ.get("MINISGL_MEGAMOE_EG_TIMING_DUMP_STEPS", "").split(","):
+            _dump = getattr(getattr(self, "_afd_adapter", None), "dump_eg_timings", None)
+            if _dump is not None:
+                _dump(f"{_prefix}_dp{self.mlp_dp_rank}_step{int(last.step_id)}.pt")
         if profile:
             log_line(
                 self.log_path,
@@ -599,15 +646,15 @@ class AfdExpertWorker(BaseAfdWorker):
                 )
 
     def afd_overlap_loop(self) -> None:
-        """Fixed two-step-ahead EG loop.
+        """Finite-window step-ahead EG loop.
 
-        Launch two future commands before retiring the oldest ack handle, matching
-        the AG loop. AfdFlushStepCmd is the explicit pipeline-drain marker.
+        Match the AG worker's configured pending window before retiring the
+        oldest ack handle. AfdFlushStepCmd drains the pipeline.
         """
         pending: deque[_AfdEgInFlight] = deque()
 
         def retire(force: bool = False) -> None:
-            while pending and (force or len(pending) > 2):
+            while pending and (force or len(pending) > self.async_retire_depth):
                 self._process_last_afd_eg(pending.popleft())
 
         while True:
