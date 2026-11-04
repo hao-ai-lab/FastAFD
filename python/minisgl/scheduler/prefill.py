@@ -35,6 +35,7 @@ class PrefillAdder:
     reserved_size: int
     cache_manager: CacheManager
     table_manager: TableManager
+    extra_reserve: int = 0
 
     def _try_allocate_one(self, req: PendingReq) -> Tuple[BaseCacheHandle, int] | None:
         if self.table_manager.available_size == 0:
@@ -45,7 +46,7 @@ class PrefillAdder:
         cached_len = handle.cached_len
         # TODO: better estimate policy
         extend_len = req.input_len - cached_len
-        estimated_len = extend_len + req.output_len
+        estimated_len = extend_len + req.output_len + self.extra_reserve
 
         if estimated_len + self.reserved_size > self.cache_manager.available_size:
             return None
@@ -75,7 +76,7 @@ class PrefillAdder:
         is_chunked = chunk_size < remain_len
         CLS = ChunkedReq if is_chunked else Req
         self.token_budget -= chunk_size
-        self.reserved_size += remain_len + pending_req.output_len
+        self.reserved_size += remain_len + pending_req.output_len + self.extra_reserve
         # NOTE: update the tokens ids only; new pages will be allocated in the scheduler
         _slice = slice(cached_len, cached_len + chunk_size)
         if self.table_manager.token_pool is not None:
@@ -141,6 +142,7 @@ class PrefillManager:
             reserved_size=self.decode_manager.inflight_tokens,
             cache_manager=self.cache_manager,
             table_manager=self.table_manager,
+            extra_reserve=self.decode_manager.extra_reserve,
         )
         reqs: List[Req] = []
         chunked_list: List[PendingReq] = []

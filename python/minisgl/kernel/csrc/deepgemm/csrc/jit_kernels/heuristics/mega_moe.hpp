@@ -124,15 +124,24 @@ static int get_num_experts_per_wave_for_mega_moe(
     return num_experts_per_wave;
 }
 
+// TMEM accumulator stages: two, or under exact FP8 block scales (each stage holds 4, 2 or 1
+// K blocks' partial products side by side for BLOCK_M 16, 32 or more, and the MMA runs ahead
+// of the epilogue's per-K-block sums only as far as there are stages) as many as fit in 448
+// columns, two to eight. The M2N EG kernel's kNumEpilogueStages is the same.
+static int get_num_epilogue_stages_for_mega_moe(const int& block_m, const bool& exact_block_scales) {
+    const int k_blocks_per_accum = block_m <= 16 ? 4 : block_m <= 32 ? 2 : 1;
+    return exact_block_scales ? std::max(2, std::min(8, 448 / (k_blocks_per_accum * block_m))) : 2;
+}
+
 static std::pair<int, int> get_pipeline_config_for_mega_moe(
     const int& smem_capacity,
     const int& num_experts, const int& hidden,
     const int& block_m, const int& block_n, const int& block_k, const int& store_block_m,
     const int& sf_block_m, const int& sf_block_n,
     const int& num_dispatch_warps, const int& num_epilogue_warps,
-    const int& num_dispatch_pull_stages = 1) {
+    const int& num_dispatch_pull_stages = 1,
+    const int& num_epilogue_stages = 2) {
     constexpr int kSmemAlignment = 1024;
-    constexpr int kNumEpilogueStages = 2;
     constexpr int kNumTMAStoreStages = 2;
     DG_HOST_ASSERT(num_dispatch_pull_stages >= 1);
 
@@ -156,7 +165,7 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe(
     // Barriers (stage-independent): dispatch + tensor memory full/empty + combine (2 per epilogue warp)
     const int smem_barriers = (
         num_dispatch_warps * num_dispatch_pull_stages +
-        kNumEpilogueStages * 2 + num_epilogue_warps * 2) * 8;
+        num_epilogue_stages * 2 + num_epilogue_warps * 2) * 8;
 
     // Amax reduction
     const int smem_amax_reduction = store_block_m * num_epilogue_warps * static_cast<int>(sizeof(float));
@@ -186,7 +195,8 @@ static MegaMoEConfig get_mega_moe_config(
     const int& num_max_tokens_per_rank, const int& num_tokens, const int& num_topk,
     const int& hidden, const int& intermediate_hidden,
     const int& num_padded_sf_pool_tokens,
-    const int& num_dispatch_pull_stages = 1) {
+    const int& num_dispatch_pull_stages = 1,
+    const bool& exact_block_scales = false) {
     // Block config
     const auto [cluster_size, block_m, store_block_m, num_epilogue_threads] =
         get_block_config_for_mega_moe(num_ranks, num_experts, num_max_tokens_per_rank, num_topk, num_tokens);
@@ -218,7 +228,8 @@ static MegaMoEConfig get_mega_moe_config(
         block_m, block_n, block_k, store_block_m,
         sf_block_m, sf_block_n,
         num_dispatch_threads / 32, num_epilogue_threads / 32,
-        num_dispatch_pull_stages);
+        num_dispatch_pull_stages,
+        get_num_epilogue_stages_for_mega_moe(block_m, exact_block_scales));
 
     const auto config = MegaMoEConfig {
         block_m, block_n, block_k,

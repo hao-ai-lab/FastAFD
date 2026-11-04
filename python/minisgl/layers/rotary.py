@@ -126,6 +126,23 @@ def set_rope_device(device: torch.device):
     _ROPE_DEVICE = device
 
 
+def freeze_rope_scaling(
+    rope_scaling: Dict[str, Any] | None,
+) -> Tuple[Tuple[str, Any], ...] | None:
+    """Build a recursively hashable RoPE cache key from HF config values."""
+
+    def freeze(value: Any) -> Any:
+        if isinstance(value, dict):
+            return tuple((key, freeze(item)) for key, item in value.items())
+        if isinstance(value, (list, tuple)):
+            return tuple(freeze(item) for item in value)
+        return value
+
+    if rope_scaling is None:
+        return None
+    return tuple((key, freeze(value)) for key, value in rope_scaling.items())
+
+
 @functools.cache
 def get_rope(
     head_dim: int,
@@ -147,4 +164,9 @@ def get_rope(
     return _get_rope(head_dim, rotary_dim, max_position, base, rope_map)
 
 
-__all__ = ["get_rope", "RotaryEmbedding", "set_rope_device"]
+__all__ = [
+    "freeze_rope_scaling",
+    "get_rope",
+    "RotaryEmbedding",
+    "set_rope_device",
+]

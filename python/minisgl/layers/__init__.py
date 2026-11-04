@@ -5,12 +5,13 @@ from .embedding import ParallelLMHead, VocabParallelEmbedding
 from .linear import (
     LinearColParallelMerged,
     LinearOProj,
+    LinearQKVGatedMerged,
     LinearQKVMerged,
     LinearReplicated,
     LinearRowParallel,
 )
 from .moe import MoELayer
-from .norm import RMSNorm, RMSNormCrossHead, RMSNormFused
+from .norm import RMSNorm, RMSNormCrossHead, RMSNormFused, RMSNormOffset, RMSNormOffsetFused
 from .rotary import get_rope, set_rope_device
 
 __all__ = [
@@ -27,9 +28,12 @@ __all__ = [
     "LinearRowParallel",
     "LinearOProj",
     "LinearQKVMerged",
+    "LinearQKVGatedMerged",
     "RMSNorm",
     "RMSNormFused",
     "RMSNormCrossHead",
+    "RMSNormOffset",
+    "RMSNormOffsetFused",
     "get_rope",
     "set_rope_device",
     "LinearReplicated",

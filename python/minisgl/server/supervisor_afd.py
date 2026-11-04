@@ -20,6 +20,8 @@ from .supervisor_ray import (
     _build_ray_runtime_env,
     _get_ray_node_resource_key,
     _get_ray_nsys_output_prefix,
+    _preflight_ray_nsys,
+    _preflight_runtime_versions,
     _resolve_nsys_bin,
 )
 
@@ -80,11 +82,50 @@ class AfdBackendSupervisor:
                     f"{_RAY_NSYS_BIN_ENV} to point to a valid `nsys` binary. "
                     f"Driver check failed: {driver_nsys_error}"
                 )
+            # Nodes that will host an nsight actor: the coordinator (driver node, see (e)) and every AG/EG
+            # worker, placed by the same function the coordinator uses (afd_worker_launcher.py).
+            from minisgl.afd_support import afd_dp_node_layout
+
+            placement = afd_dp_node_layout(
+                attn_dp_size=self.server_args.afd_attn_dp_size,
+                attn_tp_size=self.server_args.afd_attn_tp_size,
+                mlp_dp_size=self.server_args.afd_mlp_dp_size,
+                mlp_tp_size=self.server_args.afd_mlp_tp_size,
+            )
+            nsight_nodes: list[str] = []
+            for rank_nodes in (*placement.attn_rank_nodes, *placement.mlp_rank_nodes):
+                nsight_nodes.extend(rank_nodes)
+            driver_ip = ray.util.get_node_ip_address()
+            if any(n.get("NodeManagerAddress") == driver_ip for n in live_nodes):
+                nsight_nodes.append(driver_ip)
+            preflight = _preflight_ray_nsys(ray, nsight_nodes, driver_nsys_path)
+            self.logger.info("AFD nsys preflight passed: %s", {ip: r["which_nsys"] for ip, r in preflight.items()})
             nsys_prefix = _get_ray_nsys_output_prefix(self.server_args)
             nsys_dir = os.path.dirname(nsys_prefix)
             if nsys_dir:
                 os.makedirs(nsys_dir, exist_ok=True)
             self.logger.info("AFD backend Nsight Systems profiling enabled; output prefix: %s", nsys_prefix)
+
+        # (d) driver/worker env guard: every node that will host an AFD actor (the coordinator on this
+        # driver's node, see (e); the AG/EG workers where afd_worker_launcher.py places them) must run
+        # the driver's package versions, or its workers mix two envs (see _preflight_runtime_versions).
+        from minisgl.afd_support import afd_dp_node_layout
+
+        layout = afd_dp_node_layout(
+            attn_dp_size=self.server_args.afd_attn_dp_size,
+            attn_tp_size=self.server_args.afd_attn_tp_size,
+            mlp_dp_size=self.server_args.afd_mlp_dp_size,
+            mlp_tp_size=self.server_args.afd_mlp_tp_size,
+        )
+        actor_nodes: list[str] = []
+        for rank_nodes in (*layout.attn_rank_nodes, *layout.mlp_rank_nodes):
+            actor_nodes.extend(rank_nodes)
+        this_ip = ray.util.get_node_ip_address()
+        if any(n.get("NodeManagerAddress") == this_ip for n in live_nodes):
+            actor_nodes.append(this_ip)
+        env_warning = _preflight_runtime_versions(ray, actor_nodes)
+        if env_warning is not None:
+            self.logger.warning(env_warning)
 
         # (b) log dir
         if self.server_args.ray_log_dir:

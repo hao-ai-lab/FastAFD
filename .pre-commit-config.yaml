@@ -4,8 +4,12 @@ repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v5.0.0
     hooks:
+      # Recorded patches must keep their exact bytes: a blank context line of a
+      # unified diff is a single space, and the fixers would rewrite it.
       - id: trailing-whitespace
+        exclude: ^scripts/reference/patches/.*\.patch$
       - id: end-of-file-fixer
+        exclude: ^scripts/reference/patches/.*\.patch$
       - id: check-yaml
         args: [--allow-multiple-documents]
       - id: check-toml

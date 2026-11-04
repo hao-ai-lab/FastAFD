@@ -145,6 +145,12 @@ CUTLASS_DEVICE void st_shared_bulk(void* smem_ptr, const uint32_t& num_bytes) {
 }
 
 /// Global memory
+CUTLASS_DEVICE uint32_t ld_volatile(const uint32_t* ptr) {
+    uint32_t ret;
+    asm volatile("ld.volatile.global.u32 %0, [%1];" : "=r"(ret) : "l"(ptr));
+    return ret;
+}
+
 CUTLASS_DEVICE uint64_t ld_volatile(const uint64_t* ptr) {
     uint64_t ret;
     asm volatile("ld.volatile.global.b64 %0, [%1];" : "=l"(ret) : "l"(ptr));
@@ -196,6 +202,10 @@ CUTLASS_DEVICE void red_add(const uint32_t* ptr, const uint32_t& value) {
 
 CUTLASS_DEVICE void red_or_rel_sys(const uint64_t* ptr, const uint64_t& value) {
     asm volatile("red.release.sys.global.or.b64 [%0], %1;" :: "l"(ptr), "l"(value));
+}
+
+CUTLASS_DEVICE void red_or_sys(const int* ptr, const int& value) {
+    asm volatile("red.relaxed.sys.global.or.b32 [%0], %1;" :: "l"(ptr), "r"(value));
 }
 
 CUTLASS_DEVICE void red_or_rel_gpu(uint64_t* ptr, const uint64_t& value) {

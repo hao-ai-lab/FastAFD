@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import functools
+import os
 from typing import TYPE_CHECKING
 
 import torch
@@ -58,6 +59,9 @@ def _jit_minimax_route_fused_module() -> Module:
             ("launch_logits", "MiniMaxRouteFusedKernel::run_logits"),
             ("launch_logits4", "MiniMaxRouteFusedKernel::run_logits4"),
             ("launch_logits16", "MiniMaxRouteFusedKernel::run_logits16"),
+            ("launch_logits_lm", "MiniMaxRouteFusedKernel::run_logits_lm"),
+            ("launch_logits_lm_quant", "MiniMaxRouteFusedKernel::run_logits_lm_quant"),
+            ("launch_logits_lm_quant_sigmoid", "MiniMaxRouteFusedKernel::run_logits_lm_quant_sigmoid"),
             ("launch_logits4_quant", "MiniMaxRouteFusedKernel::run_logits4_quant"),
             ("launch_logits16_quant", "MiniMaxRouteFusedKernel::run_logits16_quant"),
             (
@@ -70,6 +74,9 @@ def _jit_minimax_route_fused_module() -> Module:
 
 
 _GATE_TOPK_WS: dict[tuple[str, int | None], tuple[torch.Tensor, torch.Tensor]] = {}
+# Workspaces that a larger call replaced. A CUDA graph captured against one keeps
+# its raw pointer, so freeing it would let replay write into reused memory.
+_RETIRED_WS: list = []
 _MINIMAX_ROUTE_LOGITS_WS: dict[tuple[str, int | None], torch.Tensor] = {}
 
 
@@ -82,6 +89,8 @@ def _gate_topk_workspace(device: torch.device, num_mtiles: int):
         cap = max(num_mtiles, 32)
         partials = torch.empty((16, cap, 16, 128), dtype=torch.float32, device=device)
         counters = torch.zeros((cap,), dtype=torch.int32, device=device)
+        if ws is not None:
+            _RETIRED_WS.append(ws)
         _GATE_TOPK_WS[key] = (partials, counters)
         ws = _GATE_TOPK_WS[key]
     return ws
@@ -135,9 +144,26 @@ def _minimax_route_logits_workspace(
     ws = _MINIMAX_ROUTE_LOGITS_WS.get(key)
     if ws is None or ws.shape[0] < num_tokens or ws.shape[1] != num_experts:
         cap = max(num_tokens, 512)
+        if ws is not None:
+            _RETIRED_WS.append(ws)
         ws = torch.empty((cap, num_experts), dtype=torch.float32, device=device)
         _MINIMAX_ROUTE_LOGITS_WS[key] = ws
     return ws[:num_tokens]
+
+
+def minimax_route_lane_major(gate_weight: torch.Tensor) -> torch.Tensor:
+    """The FP32 router gate ``[E, H]`` in the order the token-tiled logits kernel reads with
+    float4 loads.
+
+    Lane ``l`` of a warp accumulates elements ``l + 32 j`` in order of ``j``; element
+    ``k = 128 m + 32 i + l`` moves to ``128 m + 4 l + i`` (``[E, H / 128, 32, 4]``), so the
+    next four elements of a lane are adjacent. Same values and summation order: the logits
+    are bit-identical to the plain layout.
+    """
+    experts, hidden = gate_weight.shape
+    if hidden % 128:
+        raise ValueError(f"lane-major router gate needs hidden_size % 128 == 0, got {hidden}")
+    return gate_weight.view(experts, hidden // 128, 4, 32).transpose(2, 3).contiguous().view(experts, hidden)
 
 
 def minimax_route_topk_fp32_dot_topk(
@@ -150,8 +176,13 @@ def minimax_route_topk_fp32_dot_topk(
     warps_per_cta: int = 0,
     quant_out: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     pre_sigmoid: bool = False,
+    gate_weight_lane_major: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """MiniMax fp32 route using a custom dot kernel plus optimized topk_gating.
+
+    ``gate_weight_lane_major`` (``minimax_route_lane_major(gate_weight)``) selects the
+    token-tiled, float4-load logits kernel for the logits-only and FP8-quant launches; the
+    logits and the quant are bit-identical.
 
     This preserves the fp32 gate path while replacing:
       hidden.to(fp32) + cublasLt split-K GEMM + splitKreduce + topk_gating
@@ -181,7 +212,15 @@ def minimax_route_topk_fp32_dot_topk(
     module = _jit_minimax_route_fused_module()
     if warps_per_cta == 0:
         warps_per_cta = 16
-    if quant_out is not None:
+    if gate_weight_lane_major is not None:
+        assert gate_weight_lane_major.shape == weight.shape and gate_weight_lane_major.is_contiguous()
+        if quant_out is None:
+            module.launch_logits_lm(logits, hidden_2d, gate_weight_lane_major)
+        elif pre_sigmoid:
+            module.launch_logits_lm_quant_sigmoid(logits, hidden_2d, gate_weight_lane_major, x_q, x_sf)
+        else:
+            module.launch_logits_lm_quant(logits, hidden_2d, gate_weight_lane_major, x_q, x_sf)
+    elif quant_out is not None:
         if pre_sigmoid:
             module.launch_logits16_quant_sigmoid(logits, hidden_2d, weight, x_q, x_sf)
         elif warps_per_cta == 4:
@@ -237,6 +276,24 @@ def topk_softmax(
         topk_gating(topk_weights, topk_ids, gating_output,
                     scoring="softmax", renormalize=renormalize)
         return
+    from .vllm_kernels import router_enabled as _vllm_qwen35_router_enabled
+
+    if _vllm_qwen35_router_enabled():
+        # MINISGL_QWEN35_VLLM_ROUTER: vLLM db9527a4's topkGating<512> (csrc/jit/vllm_topk_softmax.cu),
+        # the kernel vLLM's fused_topk -> topk_softmax launches for the Qwen3.5-397B router.
+        from .vllm_topk_softmax import vllm_topk_softmax, vllm_topk_softmax_supported
+
+        if vllm_topk_softmax_supported(gating_output, topk_ids):
+            vllm_topk_softmax(topk_weights, topk_ids, gating_output, renormalize)
+            return
+    if os.environ.get("MINISGL_QWEN35_FUSED_ROUTER") == "1":
+        # One Triton launch, bit-identical to the cast + softmax + top-k kernels below
+        # (Qwen3.5-397B: 512 experts); reads the bf16 logits directly.
+        from .qwen35_router_topk import qwen35_fused_router_supported, qwen35_softmax_topk
+
+        if qwen35_fused_router_supported(num_experts, topk_ids.shape[1]):
+            qwen35_softmax_topk(topk_weights, topk_ids, gating_output, renormalize)
+            return
     if gating_output.dtype != torch.float32:
         gating_output = gating_output.float()
 
@@ -356,9 +413,9 @@ def topk_softmax_group_local(
     num_tokens, num_experts = gating_output.shape
     if num_tokens == 0:
         return
-    if (num_experts & (num_experts - 1)) != 0 or num_experts > 256:
+    if (num_experts & (num_experts - 1)) != 0 or num_experts > 512:
         raise RuntimeError(
-            "topk_softmax_group_local supports only power-of-two num_experts <= 256, "
+            "topk_softmax_group_local supports only power-of-two num_experts <= 512, "
             f"got {num_experts}"
         )
 

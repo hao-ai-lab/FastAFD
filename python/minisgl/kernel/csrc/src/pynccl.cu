@@ -60,6 +60,8 @@ const auto kNCCLDtypeMap =
     std::unordered_map<DLDataType, ncclDataType_t, DLDataTypeHash>{
         {{DLDataTypeCode::kDLFloat, 16, 1}, ncclFloat16},
         {{DLDataTypeCode::kDLBfloat, 16, 1}, ncclBfloat16},
+        {{DLDataTypeCode::kDLFloat, 32, 1}, ncclFloat32},
+        {{DLDataTypeCode::kDLInt, 32, 1}, ncclInt32},
     };
 
 using std::shared_ptr;
@@ -151,6 +153,13 @@ public:
     RuntimeCheck(dst.is_contiguous(), "Tensor must be contiguous");
     RuntimeCheck(dst.size(0) == src.size(0) * m_world_size,
                  "Destination tensor has incorrect size");
+    // NCCL moves world x src elements of src's dtype into dst: the element counts,
+    // dtypes and devices must agree exactly, or it reads or writes out of bounds
+    RuntimeCheck(dst.shape().Product() == src.shape().Product() * m_world_size,
+                 "Destination must hold exactly world_size x the source's elements");
+    RuntimeCheck(dst.dtype() == src.dtype(), "Source and destination dtypes differ");
+    RuntimeCheck(dst.device().device_id == src.device().device_id,
+                 "Source and destination are on different devices");
     const auto size_dim = static_cast<size_t>(src.shape().Product());
     const auto dtype = kNCCLDtypeMap.at(src.dtype());
     const auto src_ptr = src.data_ptr();

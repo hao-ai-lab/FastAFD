@@ -27,9 +27,29 @@ class TRTLLMMetadata(BaseAttnMetadata):
     max_seqlen_q: int
 
     page_table: torch.Tensor
+    # > 1: every request extends by exactly this many tokens and attention runs
+    # through the decode kernel's multi-token (speculative verify) mode, causal
+    # within the block, with device-side lengths only (CUDA-graph capturable).
+    q_len_per_req: int = 1
 
     def get_last_indices(self, bs: int) -> torch.Tensor:
         return self.cu_seqlens_q[1 : 1 + bs] - 1
+
+
+def _built_on_this_stream(tensor: torch.Tensor):
+    """An event marking, on the current stream, the kernels that just built `tensor`
+    (None on CPU), for a stream that reads it later (_wait_until_built)."""
+    if not tensor.is_cuda:
+        return None
+    event = torch.cuda.Event()
+    event.record()
+    return event
+
+
+def _wait_until_built(event) -> None:
+    """Order the current stream after `event` (a no-op on the stream that recorded it)."""
+    if event is not None and not torch.cuda.is_current_stream_capturing():
+        torch.cuda.current_stream().wait_event(event)
 
 
 class TensorRTLLMBackend(BaseAttnBackend):
@@ -40,13 +60,20 @@ class TensorRTLLMBackend(BaseAttnBackend):
         self.capture: TRTLLMCaptureData | None = None
         self.capture_bs: List[int] = []
         self.scale = config.head_dim**-0.5
-        self.workspace_buffer = torch.empty(
+        # FlashInfer: "Must be initialized to 0 for its first use". The TRT-LLM-gen
+        # kernels keep counters in it (multi-CTA KV reduction); torch.empty hands back
+        # whatever freed memory held, e.g. FP8 expert weights a runner just re-laid out.
+        self.workspace_buffer = torch.zeros(
             128 * 1024 * 1024, dtype=torch.uint8, device=self.kvcache.device
         )
+        # Cached device constants of the decode metadata, each with the event its
+        # building stream recorded (_built_on_this_stream), so a constant built on one
+        # stream is read safely from another.
         self._decode_cu_seqlens_q = torch.empty(
             (0,), dtype=torch.int32, device=self.kvcache.device
         )
-        self._page_offsets_by_len: dict[int, torch.Tensor] = {}
+        self._decode_cu_seqlens_q_ready = None
+        self._page_offsets_by_len: dict[int, tuple[torch.Tensor, object]] = {}
 
     def _get_decode_cu_seqlens_q(self, padded_size: int) -> torch.Tensor:
         needed = int(padded_size) + 1
@@ -56,17 +83,33 @@ class TensorRTLLMBackend(BaseAttnBackend):
                 device=self.kvcache.device,
                 dtype=torch.int32,
             )
+            self._decode_cu_seqlens_q_ready = _built_on_this_stream(self._decode_cu_seqlens_q)
+        _wait_until_built(self._decode_cu_seqlens_q_ready)
         return self._decode_cu_seqlens_q[:needed]
 
+    def _num_pages(self, num_tokens: int) -> int:
+        """Page-table columns a sequence of ``num_tokens`` tokens occupies.
+
+        Capture and replay must derive this the same way. The captured graph
+        bakes in the width of `capture.page_table`, while replay copies a table
+        built from the batch's own longest sequence; if the two rules disagree
+        the copy fails with an opaque shape error far from the cause.
+        """
+        return (int(num_tokens) + int(self.page_size) - 1) // int(self.page_size)
+
     def _get_page_offsets(self, max_seqlen_k: int) -> torch.Tensor:
-        page_count = (int(max_seqlen_k) + int(self.page_size) - 1) // int(self.page_size)
-        offsets = self._page_offsets_by_len.get(page_count)
-        if offsets is None:
+        page_count = self._num_pages(max_seqlen_k)
+        entry = self._page_offsets_by_len.get(page_count)
+        if entry is None:
             offsets = (
                 torch.arange(page_count, device=self.kvcache.device, dtype=torch.long)
                 * int(self.page_size)
             )
-            self._page_offsets_by_len[page_count] = offsets
+            entry = self._page_offsets_by_len[page_count] = (offsets, _built_on_this_stream(offsets))
+        offsets, ready = entry
+        # Another runtime's stream may have built them: without this wait its block-table
+        # gather can read the offsets before they are written (index out of bounds).
+        _wait_until_built(ready)
         return offsets
 
     def _build_page_table(
@@ -102,7 +145,7 @@ class TensorRTLLMBackend(BaseAttnBackend):
             self.kvcache.store_kv(k, v, batch.out_loc, layer_id)
         kv_cache = (self.kvcache.k_cache(layer_id), self.kvcache.v_cache(layer_id))
 
-        if batch.is_prefill:
+        if batch.is_prefill and metadata.q_len_per_req == 1:
             return trtllm_batch_context_with_kv_cache(
                 query=q,
                 kv_cache=kv_cache,
@@ -131,6 +174,7 @@ class TensorRTLLMBackend(BaseAttnBackend):
                 bmm2_scale=1.0,
                 kv_layout="NHD",
                 out_dtype=q.dtype,
+                q_len_per_req=metadata.q_len_per_req,
             )
 
     def prepare_metadata(self, batch: Batch) -> None:
@@ -164,6 +208,15 @@ class TensorRTLLMBackend(BaseAttnBackend):
             cu_seqlens_q = cu_seqlens_q.to(self.kvcache.device, non_blocking=True)
 
         new_page_table = self._build_page_table(batch, reqs, max_seqlen_k)
+        # A speculative verify step (every slot extends by the same block) runs the
+        # decode kernel's multi-token mode, as its CUDA graph does.
+        q_len_per_req = 1
+        if (
+            getattr(batch, "afd_spec_verify", False)
+            and max_seqlen_q > 1
+            and min(seqlens_q) == max_seqlen_q
+        ):
+            q_len_per_req = max_seqlen_q
         batch.attn_metadata = TRTLLMMetadata(
             cu_seqlens_k=cu_seqlens_k,
             cu_seqlens_q=cu_seqlens_q,
@@ -171,13 +224,14 @@ class TensorRTLLMBackend(BaseAttnBackend):
             max_seqlen_k=max_seqlen_k,
             max_seqlen_q=max_seqlen_q,
             page_table=new_page_table,
+            q_len_per_req=q_len_per_req,
         )
 
     def init_capture_graph(self, max_seq_len: int, bs_list: List[int]) -> None:
         assert self.capture is None, "Capture already initialized."
         max_bs = max(bs_list)
         capture = TRTLLMCaptureData.create(
-            max_bs, max_seq_len // self.page_size, self.kvcache.device
+            max_bs, self._num_pages(max_seq_len), self.kvcache.device
         )
         self.capture = capture
         self.capture_bs = sorted(bs_list)
@@ -201,6 +255,15 @@ class TensorRTLLMBackend(BaseAttnBackend):
         assert self.capture is not None and bs in self.capture_bs
         # cu_seqlens_q is always [0, 1, 2, ..., bs] for decode (i.e. no-op)
         table_len = metadata.page_table.size(1)
+        captured_len = self.capture.page_table.size(1)
+        if table_len > captured_len:
+            # Slicing to [:captured_len] would silently narrow the destination and
+            # surface as a bare shape mismatch, which says nothing about pages.
+            raise ValueError(
+                f"replay needs {table_len} page-table columns but the captured "
+                f"buffer has {captured_len} (page_size={self.page_size}); the "
+                f"capture and replay page-count rules have diverged"
+            )
         self.capture.cu_seqlens_k[: bs + 1].copy_(metadata.cu_seqlens_k)
         self.capture.seq_lens[:bs].copy_(metadata.cache_seqlens)
         self.capture.page_table[:bs, :table_len].copy_(metadata.page_table)

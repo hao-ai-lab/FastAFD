@@ -24,6 +24,15 @@ classifiers = [
 dependencies = []
 
 [project.optional-dependencies]
+cpu-test = [
+    "pytest>=8.3,<9",
+    "pytest-timeout>=2.3,<3",
+    "pytest-socket>=0.7,<1",
+    "ruff==0.11.7",
+    "transformers==4.57.3",
+    "pyzmq>=26,<28",
+    "msgpack>=1,<2",
+]
 shell = [
     "prompt_toolkit",
 ]

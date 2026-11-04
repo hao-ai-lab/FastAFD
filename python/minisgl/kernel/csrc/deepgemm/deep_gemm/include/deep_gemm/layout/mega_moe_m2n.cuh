@@ -145,4 +145,89 @@ struct WorkspaceM2N {
     }
 };
 
+// Control words of the point-to-point (P2P) protocol, the last kNumCtrlBytes of the
+// symmetric buffer (after the push-dispatch staging rows, so every older offset is
+// unchanged and the host finds them from the buffer size alone). P2P replaces the
+// union-wide tag-2/tag-3 barriers with per-pair counters, which only grow or have a
+// round's target taken off, so an early increment of the next round is never lost:
+//  - credit: each EG rank adds 1 after it cleaned a lane's workspace; an AG rank's
+//    next push on that lane needs kNumEGRanks more than its previous round took.
+//  - combine[parity]: each EG rank adds 1 after it wrote all combine rows of a layer
+//    for an AG rank, and the AG rank that dispatched those tokens adds 1 after its
+//    count push; the round is complete at kNumEGRanks + 1. Indexed by the model layer's parity: an EG pass
+//    can release a source that is already a layer ahead.
+// The other words are rank-local state of the AG credit check and of EG early start.
+struct P2PRegionsM2N {
+    static constexpr uint64_t kNumCtrlBytes = 64;
+
+    void* ctrl_base;
+
+    CUTLASS_HOST_DEVICE
+    explicit P2PRegionsM2N(void* start): ctrl_base(start) {}
+
+    CUTLASS_HOST_DEVICE
+    void* get_end_ptr() const {
+        return math::advance_ptr(ctrl_base, kNumCtrlBytes);
+    }
+
+    CUTLASS_DEVICE
+    int* get_credit_ptr() const {
+        return static_cast<int*>(ctrl_base);
+    }
+
+    CUTLASS_DEVICE
+    int* get_combine_count_ptr(const uint32_t& parity) const {
+        return static_cast<int*>(ctrl_base) + 1 + parity;
+    }
+
+    // EG ranks only (their own buffer): the early-start decision of the current
+    // (layer, lane) -- valid bit 31, a layer tag in bits 24..30, the first pass's
+    // source mask below -- and a running count of rounds split into two passes.
+    CUTLASS_DEVICE
+    int* get_eg_decision_ptr() const {
+        return static_cast<int*>(ctrl_base) + 3;
+    }
+
+    CUTLASS_DEVICE
+    int* get_eg_split_count_ptr() const {
+        return static_cast<int*>(ctrl_base) + 4;
+    }
+
+    // EG ranks only: the AG ranks whose counts of the current round are in, one
+    // bit each, OR-ed by each AG rank after its count push (a hint for the
+    // early-start decision: the passes still wait for each source's own count
+    // slots), and cleared with the decision before the credits.
+    CUTLASS_DEVICE
+    int* get_eg_arrival_ptr() const {
+        return static_cast<int*>(ctrl_base) + 5;
+    }
+
+    // EG ranks only, early start's adaptive policy for this lane: how long the
+    // late sources came after the others (ns), and a pass's time per expert it
+    // serves (ns), both running averages.
+    CUTLASS_DEVICE
+    int* get_eg_late_ns_ptr() const {
+        return static_cast<int*>(ctrl_base) + 6;
+    }
+
+    CUTLASS_DEVICE
+    int* get_eg_expert_ns_ptr() const {
+        return static_cast<int*>(ctrl_base) + 7;
+    }
+
+    // AG ranks only (their own buffer): the credit word only grows; these are how
+    // far this rank's dispatches consumed it, and how many SMs of the current
+    // dispatch launch have checked it (the last one advances the consumed value).
+    // Words 8 and 9 are the monotonic combine waits' (megamoe_m2n_mega.py).
+    CUTLASS_DEVICE
+    int* get_credit_consumed_ptr() const {
+        return static_cast<int*>(ctrl_base) + 10;
+    }
+
+    CUTLASS_DEVICE
+    int* get_credit_checked_ptr() const {
+        return static_cast<int*>(ctrl_base) + 11;
+    }
+};
+
 } // namespace deep_gemm::layout

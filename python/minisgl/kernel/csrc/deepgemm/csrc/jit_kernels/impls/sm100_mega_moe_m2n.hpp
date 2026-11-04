@@ -19,6 +19,12 @@
 
 namespace deep_gemm {
 
+// MINISGL_MEGAMOE_HANG_GUARD=1: the kernels' spins report and trap after 300 s
+static inline std::string mega_moe_m2n_hang_guard_define() {
+    const char* env = std::getenv("MINISGL_MEGAMOE_HANG_GUARD");
+    return env != nullptr and env[0] != '\0' and env[0] != '0' ? "#define DG_ENABLE_HANG_GUARD\n" : "";
+}
+
 static inline bool mega_moe_m2n_host_debug_enabled() {
     const char* env = std::getenv("MINISGL_MEGAMOE_HOST_DEBUG");
     return env != nullptr and env[0] != '\0' and env[0] != '0';
@@ -53,16 +59,21 @@ public:
         int num_tokens;
         float shared_topk_weight;
         unsigned long long* debug_timings;
+        // P2P protocol, push dispatch, combine behind a wait kernel
+        bool p2p;
+        bool push_dispatch;
+        bool waited_combine;
+        int layer_parity;
         layout::SymBuffer<> sym_buffer_ptrs;
 
         LaunchArgs launch_args;
     };
 
     static std::string generate_impl(const Args& args) {
-        return fmt::format(R"(
+        return mega_moe_m2n_hang_guard_define() + fmt::format(R"(
 #include <deep_gemm/impls/sm100_mega_moe_m2n.cuh>
 
-// m2n AG kernel ABI v3.11: protocol expert remap for remote shared expert
+// m2n AG kernel ABI v4.1: P2P protocol (late credits, local slot offsets), per-source count push marker, source index slots as index + 1, EG arrival bit, push dispatch, split combine, waited combine, opt-in hang guard
 using namespace deep_gemm;
 
 static void __instantiate_kernel() {{
@@ -82,7 +93,9 @@ static void __instantiate_kernel() {{
         {},
         {},
         {},
-        {}
+        {},
+        {},
+        {}, {}
     >);
 }};
 )", args.num_max_tokens_per_rank,
@@ -100,7 +113,10 @@ static void __instantiate_kernel() {{
     args.ag_phase,
     args.external_quant ? "true" : "false",
     args.direct_combine ? "true" : "false",
-    args.debug_timings != nullptr ? "true" : "false");
+    args.debug_timings != nullptr ? "true" : "false",
+    args.p2p ? "true" : "false",
+    args.push_dispatch ? "true" : "false",
+    args.waited_combine ? "true" : "false");
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -114,6 +130,7 @@ static void __instantiate_kernel() {{
             args.num_tokens,
             args.shared_topk_weight,
             args.debug_timings,
+            static_cast<uint32_t>(args.layer_parity),
             args.sym_buffer_ptrs
         ));
     }
@@ -154,7 +171,11 @@ static void sm100_mega_moe_m2n_ag(
     const bool& external_quant = false,
     const bool& direct_combine = false,
     const float& shared_topk_weight = 0.0f,
-    const std::optional<torch::Tensor> debug_timings = std::nullopt) {
+    const std::optional<torch::Tensor> debug_timings = std::nullopt,
+    const bool& p2p = false,
+    const int& layer_parity = 0,
+    const bool& push_dispatch = false,
+    const bool& waited_combine = false) {
     constexpr int kNumDispatchThreads = 128;
     constexpr int kNumCombineThreads = 256;
     // The kernel spin-waits for the EG combine push; a small grid keeps the
@@ -168,7 +189,14 @@ static void sm100_mega_moe_m2n_ag(
     unsigned long long* debug_timings_ptr = nullptr;
     if (debug_timings.has_value()) {
         constexpr int kAgTimingSlots = 29;
-        DG_HOST_ASSERT(debug_timings->is_cuda() and debug_timings->is_contiguous());
+        // Device memory is the normal case. Pinned host memory is also accepted
+        // because it is device-writable under unified addressing AND it survives
+        // the CUDA context: when this kernel traps, every later call on the
+        // context fails with a sticky error, so a device buffer can no longer be
+        // copied back and the timers that would say HOW FAR the kernel got are
+        // lost precisely when they matter. A pinned buffer keeps them readable.
+        DG_HOST_ASSERT(debug_timings->is_contiguous());
+        DG_HOST_ASSERT(debug_timings->is_cuda() or debug_timings->is_pinned());
         DG_HOST_ASSERT(debug_timings->scalar_type() == torch::kInt64);
         DG_HOST_ASSERT(debug_timings->numel() >= kAgTimingSlots);
         debug_timings_ptr = reinterpret_cast<unsigned long long*>(
@@ -203,6 +231,10 @@ static void sm100_mega_moe_m2n_ag(
         .num_tokens = num_tokens,
         .shared_topk_weight = shared_topk_weight,
         .debug_timings = debug_timings_ptr,
+        .p2p = p2p,
+        .push_dispatch = push_dispatch,
+        .waited_combine = waited_combine,
+        .layer_parity = layer_parity,
         .sym_buffer_ptrs = layout::SymBuffer<>(sym_buffer_ptrs, rank_idx),
         .launch_args = LaunchArgs(num_sms,
                                   kNumDispatchThreads + kNumCombineThreads,
@@ -283,16 +315,31 @@ public:
         CUtensorMap tensor_map_l2_acts_sf_3;
         const void* weight_descs;       // gmem [num_layers][4] CUtensorMap
         const void* l1_weight_ptrs;     // gmem [num_layers] const void*
+        // gmem [num_layers] const float*, each a float [E_local, L1 + L2 blocks]:
+        // the FP8 weights' own 128x128 block scales over the UE8M0 scales the
+        // MMA applies. Null when the weights were requantized to UE8M0 scales.
+        const void* block_scale_residual_ptrs;
         int num_layers;
+        // P2P protocol, push dispatch
+        bool p2p;
+        bool push_dispatch;
+        int layer_base;
+        // early start (P2P): see the kernel's `early_max_late`
+        int early_max_late;
+        int early_wait_cycles;
+        int early_policy;
+        int early_pass_cycles;
+        int early_expert_cycles;
+        int early_margin_pct;
 
         LaunchArgs launch_args;
     };
 
     static std::string generate_impl(const Args& args) {
-        return fmt::format(R"(
+        return mega_moe_m2n_hang_guard_define() + fmt::format(R"(
 #include <deep_gemm/impls/sm100_mega_moe_m2n.cuh>
 
-// m2n EG kernel ABI v4.7: optional debug timing counters
+// m2n EG kernel ABI v5.1: P2P protocol, early-start passes (arrival word, adaptive policy), per-pass debug timing, weight loaded with SF, push-dispatch staging, opt-in hang guards, source index slots waited for and cleared, per-pass source counts, exact FP8 block scales
 using namespace deep_gemm;
 
 static void __instantiate_kernel() {{
@@ -315,7 +362,8 @@ static void __instantiate_kernel() {{
         {},
         {},
         {},
-        {}
+        {},
+        {}, {}, {}
     >);
 }};
 )", args.num_max_tokens_per_rank,
@@ -336,7 +384,10 @@ static void __instantiate_kernel() {{
     args.fast_math ? "true" : "false",
     args.use_fp8_weights ? "true" : "false",
     args.num_lanes,
-    args.debug_timings != nullptr ? "true" : "false");
+    args.debug_timings != nullptr ? "true" : "false",
+    args.p2p ? "true" : "false",
+    args.push_dispatch ? "true" : "false",
+    args.block_scale_residual_ptrs != nullptr ? "true" : "false");
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -370,7 +421,15 @@ static void __instantiate_kernel() {{
             args.tensor_map_l2_acts_sf_3,
             static_cast<const CUtensorMap*>(args.weight_descs),
             static_cast<const void* const*>(args.l1_weight_ptrs),
-            static_cast<uint32_t>(args.num_layers)
+            static_cast<const float* const*>(args.block_scale_residual_ptrs),
+            static_cast<uint32_t>(args.num_layers),
+            static_cast<uint32_t>(args.layer_base),
+            static_cast<uint32_t>(args.early_max_late),
+            static_cast<uint32_t>(args.early_wait_cycles),
+            static_cast<uint32_t>(args.early_policy),
+            static_cast<uint32_t>(args.early_pass_cycles),
+            static_cast<uint32_t>(args.early_expert_cycles),
+            static_cast<uint32_t>(args.early_margin_pct)
         ));
     }
 };
@@ -410,7 +469,7 @@ static torch::Tensor make_m2n_weight_descs(
     return blob;
 }
 
-static void sm100_mega_moe_m2n_eg(
+static std::string sm100_mega_moe_m2n_eg(
     const torch::Tensor& l1_acts, const torch::Tensor& l1_acts_sf,
     const torch::Tensor& l2_acts, const torch::Tensor& l2_acts_sf,
     const torch::Tensor& l1_acts1, const torch::Tensor& l1_acts_sf1,
@@ -421,6 +480,7 @@ static void sm100_mega_moe_m2n_eg(
     const torch::Tensor& l2_acts3, const torch::Tensor& l2_acts_sf3,
     const torch::Tensor& weight_descs,    // device uint8 [num_layers, 4, 128]
     const torch::Tensor& l1_weight_ptrs,  // device int64 [num_layers]
+    const std::optional<torch::Tensor>& block_scale_residual_ptrs,  // device int64 [num_layers]
     const int& num_layers,
     const int& l1_weights_nbytes,
     const std::optional<torch::Tensor> cumulative_local_expert_recv_stats,
@@ -440,7 +500,21 @@ static void sm100_mega_moe_m2n_eg(
     const bool& use_fp8_weights,
     const int& num_sms_opt = 0,
     const int& num_prefetch_bytes_opt = 0,
-    const std::optional<torch::Tensor> debug_timings = std::nullopt
+    const std::optional<torch::Tensor> debug_timings = std::nullopt,
+    // Select, build and load the kernel instance this launch would use, then
+    // return its generated source instead of launching it. The EG kernel is one
+    // half of a cross-rank protocol and cannot run alone, so this is the only
+    // way to take its JIT compile off the step path.
+    const bool& compile_only = false,
+    const bool& p2p = false,
+    const int& layer_base = 0,
+    const int& early_max_late = 0,
+    const int& early_wait_cycles = 0,
+    const int& early_policy = 0,
+    const int& early_pass_cycles = 0,
+    const int& early_expert_cycles = 0,
+    const int& early_margin_pct = 0,
+    const bool& push_dispatch = false
 ) {
     const auto num_experts = num_experts_per_rank * num_eg_ranks;
     const auto num_padded_sf_pool_tokens = static_cast<int>(l1_acts_sf.size(0));
@@ -459,7 +533,9 @@ static void sm100_mega_moe_m2n_eg(
         num_ag_ranks, num_experts, num_experts_per_rank,
         num_max_tokens_per_rank, expected_num_tokens_per_rank, num_topk,
         hidden, intermediate_hidden, num_padded_sf_pool_tokens,
-        num_dispatch_pull_stages);
+        num_dispatch_pull_stages,
+        // exact block scales keep more accumulator stages, each with two barriers
+        block_scale_residual_ptrs.has_value());
     // The symmetric MegaMoE heuristic assumes the number of token-source ranks
     // equals the number of expert-owner ranks.  M2N breaks that assumption:
     // each EG rank receives tokens from all AG ranks but owns only the experts
@@ -627,7 +703,18 @@ static void sm100_mega_moe_m2n_eg(
         .tensor_map_l2_acts_sf_3 = tensor_map_l2_acts_sf_3,
         .weight_descs = weight_descs.data_ptr(),
         .l1_weight_ptrs = l1_weight_ptrs.data_ptr(),
+        .block_scale_residual_ptrs =
+            block_scale_residual_ptrs.has_value() ? block_scale_residual_ptrs->data_ptr() : nullptr,
         .num_layers = num_layers,
+        .p2p = p2p,
+        .push_dispatch = push_dispatch,
+        .layer_base = layer_base,
+        .early_max_late = early_max_late,
+        .early_wait_cycles = early_wait_cycles,
+        .early_policy = early_policy,
+        .early_pass_cycles = early_pass_cycles,
+        .early_expert_cycles = early_expert_cycles,
+        .early_margin_pct = early_margin_pct,
         .launch_args = LaunchArgs(num_sms,
                                   config.num_dispatch_threads + config.num_non_epilogue_threads + config.num_epilogue_threads,
                                   config.smem_size, 2)
@@ -659,11 +746,14 @@ static void sm100_mega_moe_m2n_eg(
     const auto runtime = compiler->build("sm100_mega_moe_m2n_eg", code);
     if (host_debug)
         std::cerr << "[megamoe_m2n_eg] compiler build done rank=" << rank_idx << std::endl;
+    if (compile_only)
+        return code;
     if (host_debug)
         std::cerr << "[megamoe_m2n_eg] launch begin rank=" << rank_idx << std::endl;
     SM100MegaMoEM2NEGRuntime::launch(runtime, args);
     if (host_debug)
         std::cerr << "[megamoe_m2n_eg] launch returned rank=" << rank_idx << std::endl;
+    return {};
 }
 
 } // namespace deep_gemm

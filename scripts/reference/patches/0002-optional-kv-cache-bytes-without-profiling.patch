@@ -1,0 +1,39 @@
+Subject: [PATCH 2/2] Optionally size the KV cache without memory profiling
+
+With VLLM_SKIP_MEMORY_PROFILING_WITH_KV_CACHE_BYTES=1 and kv_cache_memory_bytes
+set, the engine core uses that per-worker KV cache size instead of profiling
+the model's peak memory; without the variable nothing changes.
+
+Upstream: vLLM, https://github.com/vllm-project/vllm (Apache License 2.0),
+base commit d4004455d2357985830af10e432709b42c820455; the modified file keeps
+its SPDX license header. Apply both with `git apply` on that commit.
+
+Provenance: 0001 and 0002, each read from its `diff --git` line on, are the two
+file diffs of the uncommitted change in the vLLM checkout the FastAFD alignment
+reference was built from; concatenated they are that change as one diff,
+sha256 899ee3acce35eee4da5c3ae57e5479782e3faa1173981786f1eafe27e5e303e3.
+---
+diff --git a/vllm/v1/engine/core.py b/vllm/v1/engine/core.py
+index c9503e46d..ae96c6b39 100644
+--- a/vllm/v1/engine/core.py
++++ b/vllm/v1/engine/core.py
+@@ -247,6 +247,19 @@ class EngineCore:
+                 available_gpu_memory = [self.available_gpu_memory_for_kv_cache] * len(
+                     kv_cache_specs
+                 )
++            elif (
++                os.getenv("VLLM_SKIP_MEMORY_PROFILING_WITH_KV_CACHE_BYTES") == "1"
++                and vllm_config.cache_config.kv_cache_memory_bytes
++            ):
++                available_gpu_memory = [
++                    vllm_config.cache_config.kv_cache_memory_bytes
++                ] * len(kv_cache_specs)
++                self.available_gpu_memory_for_kv_cache = available_gpu_memory[0]
++                logger.warning(
++                    "Skipping model memory profiling and using "
++                    "kv_cache_memory_bytes=%s per worker for KV cache.",
++                    vllm_config.cache_config.kv_cache_memory_bytes,
++                )
+             else:
+                 # Profiles the peak memory usage of the model to determine how
+                 # much memory can be allocated for kv cache.

@@ -6,9 +6,11 @@ import socket
 from dataclasses import dataclass
 from pathlib import Path
 import threading
+from collections.abc import Sequence
 from typing import Any
 
 import ray
+from minisgl.ray_env_keys import AFD_WORKER_ENV_KEYS, AFD_WORKER_NODE_SCOPED_CACHE_KEYS
 from minisgl.scheduler.config import SchedulerConfig
 from minisgl.utils import div_ceil
 from minisgl.utils import is_sm100_supported
@@ -19,64 +21,8 @@ PYTHON_DIR = Path(__file__).resolve().parents[1]
 # Ray runtime environment
 # ---------------------------------------------------------------------------
 
-_NODE_SCOPED_CACHE_ENV_KEYS = (
-    "FLASHINFER_WORKSPACE_BASE",
-    "TVM_FFI_CACHE_DIR",
-    "EP_JIT_CACHE_DIR",
-    "DG_JIT_CACHE_DIR",
-    "MINISGL_DEEPEP_BUILD_DIR",
-    "MINISGL_DEEPGEMM_BUILD_DIR",
-)
-
-_RUNTIME_ENV_KEYS = (
-    "CONDA_PREFIX",
-    "CONDA_DEFAULT_ENV",
-    "PATH",
-    "LD_LIBRARY_PATH",
-    "LIBRARY_PATH",
-    "CUDA_HOME",
-    "CUDA_PATH",
-    "CUDA_NVCC_EXECUTABLE",
-    "DG_JIT_CACHE_DIR",
-    "DG_JIT_NVCC_COMPILER",
-    "DG_JIT_USE_NVRTC",
-    "TVM_FFI_CACHE_DIR",
-    "FLASHINFER_WORKSPACE_BASE",
-    "TRITON_PTXAS_BLACKWELL_PATH",
-    "MAX_JOBS",
-    "MINISGL_DEEPEP_BUILD_DIR",
-    "MINISGL_DEEPGEMM_BUILD_DIR",
-    "MINISGL_QK_NORM_ROPE_BACKEND",
-    "MINISGL_RAY_NSYS_BIN",
-    "MINISGL_RAY_NSYS_CUDA_GRAPH_TRACE",
-    "MINISGL_RAY_NSYS_START_STEP",
-    "MINISGL_RAY_NSYS_STOP_STEP",
-    "MINISGL_AFD_CONTROL_PROFILE_START_STEP",
-    "MINISGL_AFD_CONTROL_PROFILE_STOP_STEP",
-    "MINISGL_NVTX_CPU_TRACE",
-    "NSYS",
-    "MINISGL_AFD_MOE_BACKEND",
-    "MINISGL_AFD_MAX_COMM_TOKENS",
-    "MINISGL_AFD_DISABLE_DEEPEP_CPU_SYNC",
-    "MINISGL_MEGAMOE_AG_SMS",
-    "MINISGL_MEGAMOE_EG_EXPECTED_TOKENS",
-    "DG_PRINT_CONFIGS",
-    "EP_NCCL_ROOT_DIR",
-    "EP_SUPPRESS_NCCL_CHECK",
-    "EP_JIT_CACHE_DIR",
-    "NCCL_DEBUG",
-    "NCCL_DEBUG_SUBSYS",
-    "NCCL_SOCKET_IFNAME",
-    "NCCL_IB_HCA",
-    "NCCL_IB_GID_INDEX",
-    "NCCL_IB_TC",
-    "NCCL_IB_SL",
-    "NCCL_NET_GDR_LEVEL",
-    "MINISGL_AFD_ATTN_NODES",
-    "MINISGL_AFD_MLP_NODES",
-    "CUDA_LAUNCH_BLOCKING",
-    "TORCH_USE_CUDA_DSA",
-)
+_NODE_SCOPED_CACHE_ENV_KEYS = AFD_WORKER_NODE_SCOPED_CACHE_KEYS
+_RUNTIME_ENV_KEYS = AFD_WORKER_ENV_KEYS
 
 
 def _sanitize_node_tag(node_ip: str) -> str:
@@ -112,6 +58,9 @@ class AfdRuntimeSizing:
     num_page_override: int | None
     max_comm_tokens: int
     num_mb: int
+    # The per-MB size appended because the requested sizes (an explicit list,
+    # or --cuda-graph-max-bs) stop below a lane at capacity; None otherwise.
+    added_graph_bs: int | None = None
 
 
 @dataclass(frozen=True)
@@ -251,6 +200,9 @@ def runtime_env(
     cache_rank_tag: str | None = None,
 ) -> dict[str, Any]:
     env_vars: dict[str, str] = {"PYTHONPATH": str(PYTHON_DIR)}
+    prepend = os.environ.get("MINISGL_WORKER_PYTHONPATH_PREPEND")   # unset = unchanged
+    if prepend:
+        env_vars["PYTHONPATH"] = prepend + os.pathsep + str(PYTHON_DIR)
     for key in _RUNTIME_ENV_KEYS:
         value = os.environ.get(key)
         if value:
@@ -282,9 +234,15 @@ def node_resource_key(node_ip: str) -> str:
 
 
 def _node_gpu_count(node_ip: str) -> int:
-    for node in _live_nodes():
-        if node.get("NodeManagerAddress") == node_ip:
-            return int(node.get("Resources", {}).get("GPU", 0))
+    # A host can run a second, GPU-less raylet (e.g. a CPU-only entry node) under
+    # the same IP; GPU tasks pinned by node:<ip> land on the one with GPUs.
+    counts = [
+        int(node.get("Resources", {}).get("GPU", 0))
+        for node in _live_nodes()
+        if node.get("NodeManagerAddress") == node_ip
+    ]
+    if counts:
+        return max(counts)
     known_nodes = [
         str(node.get("NodeManagerAddress"))
         for node in _live_nodes()
@@ -604,6 +562,47 @@ def _normalize_decode_graph_bs(
     return tuple(sorted({s for s in sizes if s <= cuda_graph_max_bs}))
 
 
+def compute_decode_graph_sizes(
+    max_per_lane: int,
+    explicit: Sequence[int] | None = None,
+    *,
+    max_capture_size: int | None = None,
+) -> tuple[int, ...]:
+    """Per-microbatch decode graph sizes, always covering a lane at capacity.
+
+    Follows vLLM's VllmConfig._set_cudagraph_sizes (vllm/config/vllm.py): an
+    explicit list is kept as given, sorted and de-duplicated (1669-1680);
+    otherwise 1, 2, 4, then multiples of 8 below 256 and of 16 from 256 up to
+    the capture limit (1688-1708). vLLM appends max_num_batched_tokens so its
+    largest batch is captured off-stride (1701-1706); the largest AFD decode
+    batch is ``max_per_lane`` and is appended the same way. Unlike vLLM, which
+    leaves batches above its largest size to eager or piecewise execution
+    (cudagraph_dispatcher.py:282), AFD appends it to an explicit list too: all
+    lanes of a collective step replay or none does (as vLLM syncs the
+    cudagraph mode across DP ranks, v1/worker/dp_utils.py:92-98), so one lane
+    without a graph runs every lane eager, and AFD has no piecewise fallback.
+
+    Args:
+        max_per_lane: The largest per-microbatch decode batch of one attention-DP
+            lane: ceil(its max_running_req / num_mb).
+        explicit: ``--afd-decode-graph-bs``; None selects the default list.
+        max_capture_size: ``--cuda-graph-max-bs``, bounding the default list the
+            way vLLM's max_cudagraph_capture_size does; None or < 1 means
+            ``max_per_lane``.
+    """
+    max_per_lane = max(1, int(max_per_lane))
+    if explicit is not None:
+        sizes = tuple(sorted({int(bs) for bs in explicit if int(bs) > 0}))
+    else:
+        limit = max_per_lane
+        if max_capture_size is not None and int(max_capture_size) >= 1:
+            limit = min(int(max_capture_size), max_per_lane)
+        sizes = _normalize_decode_graph_bs((), limit)
+    if not sizes or sizes[-1] < max_per_lane:
+        sizes = (*sizes, max_per_lane)
+    return sizes
+
+
 def select_decode_graph_bs(active_req_count: int, buckets: tuple[int, ...]) -> int:
     """Pick the smallest captured bucket that covers `active_req_count`.
 
@@ -631,25 +630,47 @@ def build_runtime_sizing(
     afd_max_running_req: int,
     max_batched_tokens: int,
     afd_num_mb: int,
+    attn_dp_size: int = 1,
 ) -> AfdRuntimeSizing:
     num_mb = max(1, int(afd_num_mb))
     requested_graph_bs = _normalize_decode_graph_bs(
         explicit_decode_graph_bs,
         cuda_graph_max_bs,
     )
-    decode_graph_bs = (
-        requested_graph_bs
-        if _supports_decode_graph_capture(attention_backend, page_size, cache_type)
-        else ()
+    max_total_batch = (
+        int(afd_max_running_req)
+        if int(afd_max_running_req) > 0
+        else max(int(afd_batch_size), 1)
     )
-    if num_mb > 1 and decode_graph_bs:
-        max_total_batch = (
-            int(afd_max_running_req)
-            if int(afd_max_running_req) > 0
-            else max(int(afd_batch_size), 1)
+    # Graph sizes come from the scheduler's limit, as vLLM derives them from
+    # max_num_seqs (vllm/config/vllm.py:1657-1659): each attention-DP lane holds
+    # ceil(max_total_batch / attn_dp_size) requests (the coordinator's
+    # attn_max_running_req) and may decode all of them at once -- a lane whose
+    # last chunked prefill ends while other lanes still prefill does.
+    lane_graph_bs = div_ceil(div_ceil(max_total_batch, max(1, int(attn_dp_size))), num_mb)
+    decode_graph_bs: tuple[int, ...] = ()
+    added_graph_bs = None
+    if _supports_decode_graph_capture(attention_backend, page_size, cache_type):
+        explicit = None
+        if explicit_decode_graph_bs:
+            explicit = tuple(int(bs) for bs in explicit_decode_graph_bs if int(bs) > 0)
+            if num_mb > 1:
+                # A per-MB size above ceil(max_total_batch / num_mb) never fits.
+                max_per_mb = max(1, div_ceil(max_total_batch, num_mb))
+                explicit = tuple(bs for bs in explicit if bs <= max_per_mb)
+        decode_graph_bs = compute_decode_graph_sizes(
+            lane_graph_bs,
+            explicit,
+            max_capture_size=int(cuda_graph_max_bs),
         )
-        max_per_mb = max(1, div_ceil(max_total_batch, num_mb))
-        decode_graph_bs = tuple(bs for bs in decode_graph_bs if bs <= max_per_mb)
+        if explicit is not None:
+            requested_limit = max(explicit, default=0)
+        elif int(cuda_graph_max_bs) >= 1:
+            requested_limit = int(cuda_graph_max_bs)
+        else:
+            requested_limit = lane_graph_bs
+        if requested_limit < lane_graph_bs:
+            added_graph_bs = lane_graph_bs
     max_graph_bs = max(decode_graph_bs) if decode_graph_bs else 0
     max_running_req = (
         int(afd_max_running_req)
@@ -675,6 +696,7 @@ def build_runtime_sizing(
         num_page_override=num_page_override,
         max_comm_tokens=max_comm_tokens,
         num_mb=num_mb,
+        added_graph_bs=added_graph_bs,
     )
 
 
@@ -682,6 +704,7 @@ __all__ = [
     "AfdRuntimeConfig",
     "afd_dp_node_layout",
     "build_runtime_sizing",
+    "compute_decode_graph_sizes",
     "flush_log_lines",
     "log_line",
     "node_resource_key",

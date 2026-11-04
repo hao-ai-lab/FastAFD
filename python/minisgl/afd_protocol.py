@@ -354,12 +354,37 @@ class AfdAGStepPlan:
     # MoE directional dispatch bucket (num_max_dispatch_tokens_per_rank)
     dispatch_bucket: int = 0
     use_decode_graph: bool = False
+    # Explicit paging (the coordinator owns page ids): per table_indices entry, the
+    # request's cached length and how many pages it is granted this step; the granted
+    # pages (token slot of each page's first token) follow table by table. A worker
+    # writes them right after the pages it already holds for that table. Empty = the
+    # worker allocates from its own mirror of the coordinator's free list.
+    cached_lens: tuple[int, ...] = ()
+    grant_counts: tuple[int, ...] = ()
+    grant_pages: tuple[int, ...] = ()
+    # Speculative verify (spec.config): an extend of the spec block per request whose
+    # input ids are the AG token pool's bonus + draft tokens, so no token blocks.
+    spec_verify: bool = False
 
     def __post_init__(self) -> None:
         self.step_id = int(self.step_id)
         self.real_size = int(self.real_size)
+        self.spec_verify = bool(self.spec_verify)
         self.table_indices = tuple(int(x) for x in self.table_indices)
         self.extend_lens = tuple(int(x) for x in self.extend_lens)
+        self.cached_lens = tuple(int(x) for x in self.cached_lens)
+        self.grant_counts = tuple(int(x) for x in self.grant_counts)
+        self.grant_pages = tuple(int(x) for x in self.grant_pages)
+        if self.grant_counts and (
+            len(self.grant_counts) != len(self.table_indices)
+            or len(self.cached_lens) != len(self.table_indices)
+            or sum(self.grant_counts) != len(self.grant_pages)
+        ):
+            raise ValueError(
+                "AfdAGStepPlan page grants do not match its tables: "
+                f"tables={len(self.table_indices)} cached_lens={len(self.cached_lens)} "
+                f"counts={len(self.grant_counts)} pages={len(self.grant_pages)}"
+            )
         self.free_table_indices = tuple(int(x) for x in self.free_table_indices)
         self.microbatch_offsets = tuple(int(x) for x in self.microbatch_offsets)
         self.microbatch_token_offsets = tuple(
@@ -545,6 +570,7 @@ def _build_model_plan_exec(
     token_blocks: list[AfdTokenBlock] = []
     cursor = 0
     is_decode = batch.phase == "decode"
+    spec_verify = bool(getattr(batch, "afd_spec_verify", False))
 
     for req in batch.padded_reqs:
         length = int(req.extend_len)
@@ -565,7 +591,7 @@ def _build_model_plan_exec(
         exec_writebacks.append(
             sample_index >= 0 and sample_index in writeback_samples
         )
-        if not is_decode:
+        if not is_decode and not spec_verify:
             token_blocks.append(
                 AfdTokenBlock(
                     table_idx=table_idx,
@@ -607,10 +633,12 @@ class AfdModelPlan:
     exec_sample_indices: tuple[int, ...]
     exec_writebacks: tuple[bool, ...]
     token_blocks: tuple[AfdTokenBlock, ...] = ()
+    spec_verify: bool = False
 
     def __post_init__(self) -> None:
         self.step_id = int(self.step_id)
         self.size = int(self.size)
+        self.spec_verify = bool(self.spec_verify)
         self.microbatch_offsets = tuple(int(x) for x in self.microbatch_offsets)
         self.microbatch_token_offsets = tuple(int(x) for x in self.microbatch_token_offsets)
         self.microbatch_real_token_counts = tuple(
@@ -751,6 +779,7 @@ class AfdModelPlan:
             exec_sample_indices=exec_sample_indices,
             exec_writebacks=exec_writebacks,
             token_blocks=token_blocks,
+            spec_verify=bool(getattr(batch, "afd_spec_verify", False)),
         )
 
     @classmethod
@@ -819,6 +848,7 @@ class AfdModelPlan:
         plan.exec_sample_indices = tuple(exec_sample_indices)
         plan.exec_writebacks = tuple(exec_writebacks)
         plan.token_blocks = ()
+        plan.spec_verify = False
         return plan
 
 
@@ -830,10 +860,13 @@ def build_afd_ag_plan(
     dispatch_bucket: int,
     free_table_indices: tuple[int, ...] = (),
     use_decode_graph: bool = False,
+    grants: tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]] = ((), (), ()),
 ) -> AfdAGStepPlan:
-    """Assemble the AG step plan from a scheduled batch + its model plan."""
+    """Assemble the AG step plan from a scheduled batch + its model plan.
+    `grants` = (cached_lens, grant_counts, grant_pages), see AfdAGStepPlan."""
     table_indices = tuple(int(req.table_idx) for req in batch.reqs)
     extend_lens = tuple(int(req.extend_len) for req in batch.reqs)
+    cached_lens, grant_counts, grant_pages = (tuple(int(x) for x in g) for g in grants)
     if model_plan.phase == "decode" and not model_plan.token_blocks:
         plan = object.__new__(AfdAGStepPlan)
         plan.step_id = int(step_id)
@@ -854,6 +887,10 @@ def build_afd_ag_plan(
         plan.sampling = model_plan.sampling
         plan.dispatch_bucket = int(dispatch_bucket)
         plan.use_decode_graph = bool(use_decode_graph)
+        plan.cached_lens = cached_lens
+        plan.grant_counts = grant_counts
+        plan.grant_pages = grant_pages
+        plan.spec_verify = False
         return plan
     return AfdAGStepPlan(
         step_id=int(step_id),
@@ -874,6 +911,10 @@ def build_afd_ag_plan(
         sampling=model_plan.sampling,
         dispatch_bucket=int(dispatch_bucket),
         use_decode_graph=bool(use_decode_graph),
+        cached_lens=cached_lens,
+        grant_counts=grant_counts,
+        grant_pages=grant_pages,
+        spec_verify=bool(model_plan.spec_verify),
     )
 
 
@@ -902,6 +943,77 @@ class AfdAGStepReply(AfdReply):
 @dataclass
 class AfdEGStepReply(AfdReply):
     pass
+
+
+# ============================================================================
+# CAD decode (minisgl.cad, MINISGL_AFD_MODE=cad). Prefill steps stay AFD
+# steps (AfdRunAGStepCmd / AfdRunEGStepCmd); decode steps go as one AfdRunCadStepCmd per GPU, no EG command.
+# ============================================================================
+
+
+@dataclass
+class AfdCadInitCmd(AfdCommand):
+    """Every attention and model rank, once, before the first step (collective in this order on every rank:
+    minisgl.cad.groups.cad_groups, CadWindow.allocate over the union world, [model ranks only: the dual-role MegaMoE
+    rendezvous over the model group + its EG precompile], CadNodeRuntime.warm(sorted buckets)). The window is the FIRST
+    symm_mem rendezvous of the CAD init on every rank: torch keys every rendezvous by one per-process sequence number,
+    so a model-only rendezvous before it would leave the ranks on different keys.
+    MINISGL_AFD_CAD_INIT_TIMEOUT_S (default 900) bounds the coordinator's wait for every rank's ready reply. buckets: the per-mb decode buckets (rows of
+    one attention GPU in one microbatch; the coordinator's decode_graph_bs); t_max = max(buckets); table_rows: the
+    attention GPUs' request-table rows (the model GPU's last-token slots, minisgl.cad.tokens)."""
+
+    num_mb: int
+    t_max: int
+    buckets: tuple[int, ...]
+    table_rows: int
+    use_graph: bool = True
+
+
+@dataclass
+class AfdCadReadyReply(AfdReply):
+    step_id: int | None = None
+    captured: tuple[int, ...] = ()   # the buckets this GPU captured a graph for
+
+
+@dataclass
+class AfdRunCadStepCmd(AfdCommand):
+    """One CAD decode step for one GPU. An attention rank gets plans = [its own AfdAGStepPlan] (KV grants and the
+    materialized sub-batches, as an AFD AG step, kv_only); model GPU j gets plans = the r plans of its attention GPUs in
+    peer order (minisgl.cad.layout.peers_of) and model_rows = one minisgl.cad.tokens.CadRow per real request of those
+    plans. bucket: the per-mb rows of every attention GPU (uniform over the step; the model GPU's mb has r x bucket)."""
+
+    step_id: int
+    plans: list[AfdAGStepPlan]
+    bucket: int
+    use_graph: bool
+    model_rows: tuple = ()
+    sent_ns: int = 0
+
+
+@dataclass
+class AfdCadStepReply(AfdReply):
+    """Model GPU: tokens = {peer: the step's sampled tokens of that peer's requests, in model_rows order}; attention
+    rank: tokens = {}. err: the window's abort word after the step (non-zero = a flag wait timed out)."""
+
+    tokens: dict = field(default_factory=dict)
+    err: int = 0
+
+
+def cad_microbatch_rows(padded_reqs: list, real_reqs: list, microbatch_offsets: tuple[int, ...]) -> list[tuple[int, int]]:
+    """(mb, i) of every real request (in real_reqs order) in its attention GPU's materialized sub-batches: the
+    coordinator's padded layout (afd_scheduler._pad_and_split_batch: per mb a real prefix + dummy tail when balanced,
+    else real requests first) is the one the attention runtime rebuilds (afd_attention_runtime._build_padded_reqs)."""
+    where: dict[int, tuple[int, int]] = {}
+    offs = tuple(int(x) for x in microbatch_offsets)
+    for mb in range(len(offs) - 1):
+        for i, req in enumerate(padded_reqs[offs[mb]:offs[mb + 1]]):
+            where.setdefault(id(req), (mb, i))
+    out = []
+    for req in real_reqs:
+        if id(req) not in where:
+            raise ValueError(f"CAD: request table {getattr(req, 'table_idx', '?')} is not in the padded batch")
+        out.append(where[id(req)])
+    return out
 
 
 # AFD ZMQ queues use pickle. Most commands/replies are faster and clearer as
@@ -991,6 +1103,11 @@ AfdReply.decoder = staticmethod(_decode_afd_reply)  # type: ignore[attr-defined]
 
 __all__ = [
     "AfdAGStepPlan",
+    "AfdCadInitCmd",
+    "AfdCadReadyReply",
+    "AfdCadStepReply",
+    "AfdRunCadStepCmd",
+    "cad_microbatch_rows",
     "AfdEGStepPlan",
     "AfdModelPlan",
     "AfdRunAGStepCmd",

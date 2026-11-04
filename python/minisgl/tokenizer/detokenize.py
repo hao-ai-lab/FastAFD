@@ -68,6 +68,26 @@ class DetokenizeManager:
         self.eos_token_id = self.tokenizer.eos_token_id
 
     def detokenize(self, msgs: List[DetokenizeMsg]) -> List[str]:
+        # A uid can carry several tokens in one batch (speculative decoding commits
+        # up to a block per step). The decode status advances per message, so each
+        # round takes at most one message per uid, in arrival order.
+        if len({msg.uid for msg in msgs}) == len(msgs):
+            return self._detokenize_round(msgs)
+        out: List[str] = [""] * len(msgs)
+        pending = list(range(len(msgs)))
+        while pending:
+            seen: set[int] = set()
+            this_round: List[int] = []
+            later: List[int] = []
+            for i in pending:
+                (later if msgs[i].uid in seen else this_round).append(i)
+                seen.add(msgs[i].uid)
+            for i, text in zip(this_round, self._detokenize_round([msgs[i] for i in this_round])):
+                out[i] = text
+            pending = later
+        return out
+
+    def _detokenize_round(self, msgs: List[DetokenizeMsg]) -> List[str]:
         read_ids: List[List[int]] = []
         surr_ids: List[List[int]] = []
         for msg in msgs:

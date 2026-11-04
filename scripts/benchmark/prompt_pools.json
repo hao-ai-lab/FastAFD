@@ -1,0 +1,72 @@
+{
+ "minimax-m2.5_isl4096_r20480": {
+  "model": "minimax-m2.5",
+  "isl": 4096,
+  "rows": 20480,
+  "txt_sha256": "21b1f7a1e63f0327b63f7dd219c4a3da9f6f8b145c6bd28d207454bb0e8d00b5",
+  "stream_tokens": 12260633
+ },
+ "minimax-m2.5_isl8192_r10240": {
+  "model": "minimax-m2.5",
+  "isl": 8192,
+  "rows": 10240,
+  "txt_sha256": "afa0f677a02ecc8fb360f2808fb963a1511bebd7904bd22dc9656def33e493d0",
+  "stream_tokens": 12260633
+ },
+ "minimax-m2.5_isl16384_r5120": {
+  "model": "minimax-m2.5",
+  "isl": 16384,
+  "rows": 5120,
+  "txt_sha256": "dc545f06efe388518c4119b19b12e7f775064ddb33b389d9709f26571d73bf3e",
+  "stream_tokens": 12260633
+ },
+ "qwen3-235b_isl4096_r20480": {
+  "model": "qwen3-235b",
+  "isl": 4096,
+  "rows": 20480,
+  "txt_sha256": "9de82948fd0852b7a78f78b2a1ad775144c23a66d039e473b4378de52cf65404",
+  "stream_tokens": 12583936
+ },
+ "qwen3-235b_isl8192_r10240": {
+  "model": "qwen3-235b",
+  "isl": 8192,
+  "rows": 10240,
+  "txt_sha256": "19305613345ad0dc2f01faa8c9b95cafb969a70a811bb1e04ad03d1d755ea49a",
+  "stream_tokens": 12583936
+ },
+ "qwen3-235b_isl16384_r5120": {
+  "model": "qwen3-235b",
+  "isl": 16384,
+  "rows": 5120,
+  "txt_sha256": "84c92ca88c4f895cdf34a3ced2f67d8b2c6fd4e1924fdafebcfc3e17a7dbbae0",
+  "stream_tokens": 12583936
+ },
+ "qwen3-235b_isl32768_r2560": {
+  "model": "qwen3-235b",
+  "isl": 32768,
+  "rows": 2560,
+  "txt_sha256": "07a3fad2f2fcddee1f7c2f06c92cfd9ba62da634a6418ba908196119c2a4cdc8",
+  "stream_tokens": 12583936
+ },
+ "qwen3.5-397b_isl4096_r37376": {
+  "model": "qwen3.5-397b",
+  "isl": 4096,
+  "rows": 37376,
+  "txt_sha256": "da15f5b55d24e0ee63deeb910040c816f2eec62a6190cb2b6f8ec47efaa2089f",
+  "stream_tokens": 12549017
+ },
+ "qwen3.5-397b_isl8192_r27392": {
+  "model": "qwen3.5-397b",
+  "isl": 8192,
+  "rows": 27392,
+  "txt_sha256": "1f60bd7f7057cc17bffbe586e7139e44d99396ab9816cd01cfdf50e01d0a307a",
+  "stream_tokens": 12549017
+ },
+ "qwen3.5-397b_isl16384_r18176": {
+  "model": "qwen3.5-397b",
+  "isl": 16384,
+  "rows": 18176,
+  "txt_sha256": "624ca4eae822d6e46939d4e697b11bd73f6738b4fdafdbd6fbe8e07d2b4c3d82",
+  "stream_tokens": 12549017
+ }
+}

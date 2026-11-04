@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from functools import lru_cache
 from typing import Any, Dict, List
 
@@ -15,6 +16,21 @@ from .base import BaseOP
 def _dense_fp8_use_bf16_cublas() -> bool:
     """Dequant fp8 dense weights to bf16 and use cuBLAS (decode-skinny win)."""
     return False
+
+
+@lru_cache(maxsize=1)
+def _dense_gemm_sms() -> int:
+    """MINISGL_DENSE_GEMM_SMS=n: FP8 dense GEMMs on <= 64 tokens run on n SMs (DeepGEMM's persistent grid), so
+    they can sit beside the other microbatch's attention (MINISGL_AFD_LANE_COMPUTE_STREAMS) instead of after it."""
+    return int(os.environ.get("MINISGL_DENSE_GEMM_SMS", "0"))
+
+
+def _vllm_qwen35_quant(x2d: torch.Tensor) -> bool:
+    """MINISGL_QWEN35_VLLM_QUANT (default: follows MINISGL_QWEN35_VLLM_KERNELS) and an input the vendored
+    vLLM kernel is instantiated for (bf16, K a multiple of 128)."""
+    from minisgl.kernel.vllm_kernels import quant_enabled
+
+    return quant_enabled() and x2d.dtype == torch.bfloat16 and x2d.shape[-1] % 128 == 0
 
 
 class _LinearTPImpl(BaseOP):
@@ -127,6 +143,21 @@ class _LinearTPImpl(BaseOP):
     def _fp8_weight_for_deepgemm(self) -> tuple[torch.Tensor, torch.Tensor]:
         if self._fp8_weight_scale_for_deepgemm is not None:
             return self.weight, self._fp8_weight_scale_for_deepgemm
+        # Everything past this point allocates and launches kernels: the
+        # per-channel format dequantizes to FP32 and re-quantizes to 128x128
+        # blocks. `load_state_dict` normally does it eagerly, but only
+        # when the weight is already on CUDA. If it did not, the work lands here
+        # -- inside the forward, and therefore inside CUDA graph capture, which
+        # corrupts the graph and surfaces later as an unexplained launch failure
+        # rather than as an error at the offending line.
+        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "FP8 dense weight preparation is running during CUDA graph "
+                f"capture (scale_format={self._fp8_scale_format!r}). It allocates "
+                "and launches kernels, so it must happen at load time. This layer "
+                "was not prepared eagerly -- check that load_state_dict saw the "
+                "weight already on CUDA."
+            )
         if self._fp8_scale_format == "channel":
             if not hasattr(self, "weight_scale"):
                 raise RuntimeError("FP8 dense linear is missing weight_scale")
@@ -201,24 +232,39 @@ class _LinearTPImpl(BaseOP):
         from minisgl.kernel import deepgemm as deep_gemm
 
         input_2d = x.contiguous().view(-1, x.shape[-1])
-        input_fp8, input_scale = deep_gemm.per_token_cast_to_fp8(
-            input_2d,
-            use_ue8m0=True,
-            gran_k=128,
-            use_packed_ue8m0=True,
-        )
+        if _vllm_qwen35_quant(input_2d):
+            # MINISGL_QWEN35_VLLM_QUANT: vLLM's QuantFP8 -> per_token_group_quant_fp8_packed_for_deepgemm
+            from minisgl.kernel.vllm_per_token_group_quant import per_token_group_quant_fp8_packed_for_deepgemm
+
+            input_fp8, input_scale = per_token_group_quant_fp8_packed_for_deepgemm(input_2d, 128)
+        else:
+            input_fp8, input_scale = deep_gemm.per_token_cast_to_fp8(
+                input_2d,
+                use_ue8m0=True,
+                gran_k=128,
+                use_packed_ue8m0=True,
+            )
         weight, weight_scale = self._fp8_weight_for_deepgemm()
         output = torch.empty(
             (input_fp8.size(0), weight.size(0)),
             dtype=torch.bfloat16,
             device=input_fp8.device,
         )
-        deep_gemm.fp8_gemm_nt(
-            (input_fp8, input_scale),
-            (weight, weight_scale),
-            output,
-            disable_ue8m0_cast=False,
-        )
+        sms = _dense_gemm_sms() if input_fp8.size(0) <= 64 else 0
+        if sms:
+            ext = deep_gemm._load_extension()
+            full = ext.get_num_sms()
+            ext.set_num_sms(sms)
+        try:
+            deep_gemm.fp8_gemm_nt(
+                (input_fp8, input_scale),
+                (weight, weight_scale),
+                output,
+                disable_ue8m0_cast=False,
+            )
+        finally:
+            if sms:
+                ext.set_num_sms(full)
         if self.bias is not None:
             output = output + self.bias
         return output.to(dtype=x.dtype).view(*x.shape[:-1], weight.size(0))
@@ -249,12 +295,21 @@ class _LinearTPImpl(BaseOP):
             dtype=torch.bfloat16,
             device=input_fp8.device,
         )
-        deep_gemm.fp8_gemm_nt(
-            (input_fp8, input_scale),
-            (weight, weight_scale),
-            output,
-            disable_ue8m0_cast=False,
-        )
+        sms = _dense_gemm_sms() if input_fp8.size(0) <= 64 else 0
+        if sms:
+            ext = deep_gemm._load_extension()
+            full = ext.get_num_sms()
+            ext.set_num_sms(sms)
+        try:
+            deep_gemm.fp8_gemm_nt(
+                (input_fp8, input_scale),
+                (weight, weight_scale),
+                output,
+                disable_ue8m0_cast=False,
+            )
+        finally:
+            if sms:
+                ext.set_num_sms(full)
         if self.bias is not None:
             output = output + self.bias
         return output.to(dtype=output_dtype).view(*output_shape_prefix, weight.size(0))
@@ -334,6 +389,32 @@ class LinearQKVMerged(_LinearTPImpl):
         self._use_bf16_cublas_for_fp8 = False
 
 
+class LinearQKVGatedMerged(_LinearTPImpl):
+    """QKV projection whose Q rows carry per-head query and output gate."""
+
+    def __init__(
+        self,
+        hidden_size: int,
+        head_dim: int,
+        num_qo_heads: int,
+        num_kv_heads: int,
+        has_bias: bool,
+        quant: Any | None = None,
+    ):
+        tp_info = get_tp_info()
+        local_num_qo = div_even(num_qo_heads, tp_info.size)
+        local_num_kv = div_even(num_kv_heads, tp_info.size, allow_replicate=True)
+        super().__init__(
+            hidden_size,
+            (2 * num_qo_heads + 2 * num_kv_heads) * head_dim,
+            hidden_size,
+            (2 * local_num_qo + 2 * local_num_kv) * head_dim,
+            has_bias,
+            quant=quant,
+        )
+        self._use_bf16_cublas_for_fp8 = False
+
+
 class LinearOProj(_LinearTPImpl):
     def __init__(
         self,
@@ -393,3 +474,54 @@ class LinearRowParallel(_LinearTPImpl):
         if self._tp_size > 1:
             y = self._comm.all_reduce(y)
         return y
+
+
+def _walk_ops(root: BaseOP):
+    """Every BaseOP reachable from `root` through attributes and lists, each once.
+    minisgl ops are not nn.Modules, so there is no `modules()` to call."""
+    seen: set[int] = set()
+    stack: list[Any] = [root]
+    while stack:
+        obj = stack.pop()
+        if isinstance(obj, (list, tuple)):
+            stack.extend(obj)
+            continue
+        if not isinstance(obj, BaseOP) or id(obj) in seen:
+            continue
+        seen.add(id(obj))
+        yield obj
+        stack.extend(vars(obj).values())
+
+
+def warmup_fp8_dense_gemms(model: BaseOP, max_tokens: int) -> tuple[int, int]:
+    """Run every FP8 dense linear shape of `model` at every token count up to
+    `max_tokens`, so the DeepGEMM kernels (and the activation quant kernels) a prefill can
+    select are compiled now, not mid-serving.
+
+    DeepGEMM picks its block sizes from the token count M, so prefills of arbitrary
+    lengths (a prefix cache computes only the uncached suffix) keep selecting new kernel
+    configs, each compiled on first use for ~2 s while holding the GIL. Compiled kernels
+    persist in the JIT cache, so later starts on the same tree only replay the sweep.
+    Returns (shapes, calls).
+    """
+    by_shape: dict[tuple[int, int], _LinearTPImpl] = {}
+    for module in _walk_ops(model):
+        weight = getattr(module, "weight", None)
+        if isinstance(module, _LinearTPImpl) and weight is not None and weight.dtype == torch.float8_e4m3fn \
+                and weight.is_cuda and weight.dim() == 2 and weight.numel() > 0:
+            by_shape.setdefault(tuple(weight.shape), module)
+    max_tokens = int(max_tokens)
+    # every M where the configs are small and dense, then strided: DeepGEMM's block_m
+    # candidates are multiples of 16
+    sizes = sorted(set(range(1, min(1024, max_tokens) + 1))
+                   | set(range(1024, min(4096, max_tokens) + 1, 8))
+                   | set(range(4096, max_tokens + 1, 16)) | {max_tokens})
+    calls = 0
+    with torch.inference_mode():
+        for (_, k), module in by_shape.items():
+            x = torch.zeros((max_tokens, k), dtype=torch.bfloat16, device=module.weight.device)
+            for n in sizes:
+                module._forward_fp8(x[:n])
+                calls += 1
+            torch.cuda.synchronize()
+    return len(by_shape), calls

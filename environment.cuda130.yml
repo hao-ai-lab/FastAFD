@@ -19,7 +19,8 @@ channels:
 #   runtime package set.
 
 dependencies:
-  - python=3.12
+  # Ray requires the driver and the cluster to match to the patch version.
+  - python=3.12.13
   - pip>=25
   - cxx-compiler
   - cmake>=3.22
@@ -50,5 +51,10 @@ dependencies:
       # succeeds. For DeepEP V2 / AFD runs, force-upgrade NCCL after creating
       # the env; see README.md.
       - nvidia-nccl-cu13==2.28.9
-      - flashinfer-python==0.6.6
+      # Same FlashInfer release as the vLLM reference (scripts/reference/
+      # requirements.lock), so both sides load the same trtllm-gen attention
+      # cubins. The cubins ship in flashinfer-cubin, so pin it to the same
+      # release.
+      - flashinfer-python==0.6.11.post2
+      - flashinfer-cubin==0.6.11.post2
       - triton==3.6.0
