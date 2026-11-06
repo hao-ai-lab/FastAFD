@@ -8,7 +8,7 @@
 <p align="center"><b>Fast Attention–FFN Disaggregation for MoE Serving</b></p>
 
 <p align="center">
-| <a href="https://haoailab.com/blogs/fastafd/">Blog</a> | <a href="#">X</a> |
+| <a href="https://arxiv.org/abs/2611.07149">arXiv</a> | <a href="https://haoailab.com/blogs/fastafd/">Blog</a> | <a href="#">X</a> |
 </p>
 
 ---
@@ -350,11 +350,13 @@ components from the broader open-source LLM systems community, including
 If you find FastAFD useful, please cite:
 
 ```bibtex
-@misc{fastafd2026,
-  title  = {FastAFD: Open-Source Large-Scale Attention-FFN Disaggregation on Blackwell NVL72},
-  author = {Fu, Yichao and Zhang, Yuxuan and Zhang, Minshen and Wang, Ruitian and Chen, Junda and Zhang, Hao},
-  year   = {2026},
-  url    = {https://github.com/hao-ai-lab/FastAFD},
-  note   = {Technical blog and open-source release}
+@misc{fu2026fastafddoesattentionffndisaggregation,
+      title={FastAFD: When Does Attention-FFN Disaggregation Pay on Rack-Scale NVLink?},
+      author={Yichao Fu and Yuxuan Zhang and Minshen Zhang and Ruitian Wang and Junda Chen and Hao Zhang},
+      year={2026},
+      eprint={2611.07149},
+      archivePrefix={arXiv},
+      primaryClass={cs.DC},
+      url={https://arxiv.org/abs/2611.07149},
 }
 ```
